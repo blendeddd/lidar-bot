@@ -1,0 +1,1785 @@
+diff --git a/General_Driver/General_Driver.ino b/General_Driver/General_Driver.ino
+index 23c2adc..b91fabf 100644
+--- a/General_Driver/General_Driver.ino
++++ b/General_Driver/General_Driver.ino
+@@ -1,4 +1,5 @@
+ #include <ArduinoJson.h>
++#include <ArduinoOTA.h>
+ StaticJsonDocument<256> jsonCmdReceive;
+ StaticJsonDocument<256> jsonInfoSend;
+ StaticJsonDocument<512> jsonInfoHttp;
+@@ -60,6 +61,9 @@ StaticJsonDocument<512> jsonInfoHttp;
+ // functions for wifi ctrl.
+ #include "wifi_ctrl.h"
+ 
++// lidar-bot: runtime robot config + full status.
++#include "robot_config.h"
++
+ // functions for esp-now.
+ #include "esp_now_ctrl.h"
+ 
+@@ -105,21 +109,17 @@ void setup() {
+   ina219_init();
+   inaDataUpdate();
+ 
++  packMonitorInit();
++  packDataUpdate();
++
+   // set mainType & moduleType.
+   // mainType: 1.WAVE ROVER, 2.UGV02, 3.UGV01
+   // moduleType: 0.Null, 1.RoArm, 2.PT
+   mm_settings(mainType, moduleType);
+ 
+   init_oled();
+-  if (mainType == 1) {
+-    screenLine_0 = "WAVE ROVER";
+-  } else if (mainType == 2) {
+-    screenLine_0 = "UGV";
+-  } else if (mainType == 3) {
+-    screenLine_0 = "UGV";
+-  } 
+-  
+-  screenLine_1 = "version: 0.95";
++  screenLine_0 = "blendedd v0.1";
++  screenLine_1 = "lidar-bot";
+   screenLine_2 = "starting...";
+   screenLine_3 = "";
+   oled_update();
+@@ -139,6 +139,13 @@ void setup() {
+   if(InfoPrint == 1){Serial.println("Initialize LittleFS for Flash files ctrl.");}
+   initFS();
+ 
++  // lidar-bot: geometry from flash overrides the mainType defaults.
++  if (loadRobotConfig()) {
++    if(InfoPrint == 1){Serial.println("Robot config loaded from flash.");}
++  } else {
++    if(InfoPrint == 1){Serial.println("No saved robot config, using defaults.");}
++  }
++
+   // init the funcs in switch_module.h
+   screenLine_2 = screenLine_3;
+   screenLine_3 = "Initialize 12V-switch ctrl";
+@@ -195,6 +202,32 @@ void setup() {
+   if(InfoPrint == 1){Serial.println("WiFi init.");}
+   initWifi();
+ 
++  // --- lidar-bot: over-the-air firmware updates ---
++  screenLine_3 = "OTA init";
++  oled_update();
++  ArduinoOTA.setHostname("lidar-bot");
++  ArduinoOTA.setPassword("lidarbot");        // change me
++  ArduinoOTA.onStart([]() {
++    setGoalSpeed(0, 0);                      // wheels off before flashing
++    leftCtrl(0); rightCtrl(0);
++    screenLine_3 = "OTA: updating...";
++    oled_update();
++  });
++  ArduinoOTA.onProgress([](unsigned int p, unsigned int t) {
++    screenLine_3 = "OTA: " + String(p / (t / 100)) + "%";
++    oled_update();
++  });
++  ArduinoOTA.onEnd([]() {
++    screenLine_3 = "OTA: rebooting";
++    oled_update();
++  });
++  ArduinoOTA.onError([](ota_error_t e) {
++    screenLine_3 = "OTA: error " + String(e);
++    oled_update();
++  });
++  ArduinoOTA.begin();
++  if(InfoPrint == 1){Serial.println("OTA ready: lidar-bot.local");}
++
+   screenLine_3 = "http & web init";
+   oled_update();
+   if(InfoPrint == 1){Serial.println("http & web init.");}
+@@ -216,6 +249,7 @@ void setup() {
+   initEncoders();
+ 
+   pidControllerInit();
++  setPID(__kp, __ki, __kd, windup_limits);   // apply gains from flash
+ 
+   screenLine_2 = String("MAC:") + macToString(thisDevMac);
+   oled_update();
+@@ -231,6 +265,7 @@ void setup() {
+ void loop() {
+   serialCtrl();
+   server.handleClient();
++  ArduinoOTA.handle();
+ 
+   // read and compute the info of joints.
+   switch (moduleType) {
+diff --git a/General_Driver/battery_ctrl.h b/General_Driver/battery_ctrl.h
+index f75cc0f..65d19d8 100644
+--- a/General_Driver/battery_ctrl.h
++++ b/General_Driver/battery_ctrl.h
+@@ -25,4 +25,103 @@ void inaDataUpdate(){
+   power_mW = ina219.getBusPower();
+   loadVoltage_V  = busVoltage_V + (shuntVoltage_mV/1000);
+   ina219_overflow = ina219.getOverflow();
+-}
+\ No newline at end of file
++}
++
++// --- --- --- pack voltage monitor (second INA219) --- --- ---
++// Wiring: VIN+ and VIN- both tied to battery positive, so no load current
++// passes through the shunt; bus voltage still reads raw pack voltage.
++// Module default address is 0x40 (bridge A0 for 0x41). Onboard INA219 is 0x42.
++#define PACK_INA219_ADDRESS 0x41
++
++// Ozito PXC 18V pack (5S li-ion): ~21.0V full, ~15.0V empty.
++#define PACK_LOW_VOLTAGE     15.5   // flag low below this
++#define PACK_RECOVER_VOLTAGE 16.0   // clear the flag above this (hysteresis)
++
++// Active buzzer on low battery. Set to a free, broken-out GPIO to enable;
++// -1 leaves it disabled.
++#define PACK_BUZZER_PIN -1
++
++INA219_WE packIna219 = INA219_WE(PACK_INA219_ADDRESS);
++
++float packVoltage_V = 0.0;
++float packCurrent_mA = 0.0;
++bool  packMonitorOnline = false;
++bool  packLowVoltage = false;
++
++void packMonitorInit(){
++  packMonitorOnline = packIna219.init();
++  if(!packMonitorOnline){
++    Serial.println("Pack INA219 not connected!");
++    return;
++  }
++  packIna219.setADCMode(BIT_MODE_9);
++  packIna219.setPGain(PG_320);
++  packIna219.setBusRange(BRNG_32);      // pack reaches 21V, needs the 32V range
++  packIna219.setShuntSizeInOhms(0.1);
++  if(PACK_BUZZER_PIN >= 0){
++    pinMode(PACK_BUZZER_PIN, OUTPUT);
++    digitalWrite(PACK_BUZZER_PIN, LOW);
++  }
++}
++
++void packDataUpdate(){
++  if(!packMonitorOnline){
++    return;
++  }
++  packVoltage_V = packIna219.getBusVoltage_V();
++  packCurrent_mA = packIna219.getCurrent_mA();
++
++  if(!packLowVoltage && packVoltage_V < PACK_LOW_VOLTAGE){
++    packLowVoltage = true;
++    Serial.println("Battery low!");
++  } else if(packLowVoltage && packVoltage_V > PACK_RECOVER_VOLTAGE){
++    packLowVoltage = false;
++  }
++
++  if(PACK_BUZZER_PIN >= 0){
++    digitalWrite(PACK_BUZZER_PIN, packLowVoltage ? HIGH : LOW);
++  }
++}
++
++// short suffix for the oled line
++String packStatusStr(){
++  if(!packMonitorOnline){
++    return "";
++  }
++  if(packLowVoltage){
++    return " BAT LOW!";
++  }
++  return " B:" + String(packVoltage_V, 1);
++}
++
++
++// --- --- --- pack state of charge --- --- ---
++// li-ion discharge curve, per cell. 5 cells in series (Ozito PXC 18V).
++#define PACK_CELLS 5
++
++int packPercent(){
++  if(!packMonitorOnline){
++    return -1;
++  }
++  static const float curveV[] = {4.20,4.15,4.11,4.08,4.02,3.98,3.95,3.91,3.87,
++                                 3.85,3.84,3.82,3.80,3.79,3.77,3.75,3.73,3.71,
++                                 3.69,3.61,3.27};
++  static const int   curveP[] = {100,95,90,85,80,75,70,65,60,
++                                 55,50,45,40,35,30,25,20,15,
++                                 10,5,0};
++  const int n = sizeof(curveP)/sizeof(curveP[0]);
++
++  float cell = packVoltage_V / PACK_CELLS;
++
++  if(cell >= curveV[0])   return 100;
++  if(cell <= curveV[n-1]) return 0;
++
++  for(int i = 1; i < n; i++){
++    if(cell >= curveV[i]){
++      float span = curveV[i-1] - curveV[i];
++      float frac = (cell - curveV[i]) / span;
++      return curveP[i] + (int)(frac * (curveP[i-1] - curveP[i]));
++    }
++  }
++  return 0;
++}
+diff --git a/General_Driver/http_server.h b/General_Driver/http_server.h
+index 2ec6463..b4ff72b 100644
+--- a/General_Driver/http_server.h
++++ b/General_Driver/http_server.h
+@@ -1,14 +1,74 @@
+ #include "web_page.h"
++#include <Update.h>
+ 
+ // Create AsyncWebServer object on port 80
+ WebServer server(80);
+ 
+ void handleRoot(){
+-  server.send(200, "text/html", index_html); //Send web page
++  // send straight from PROGMEM: server.send() would copy the whole page into
++  // heap first, which fails once the page gets large.
++  server.setContentLength(strlen_P(index_html));
++  server.send_P(200, PSTR("text/html"), index_html);
++}
++
++const char ota_html[] PROGMEM = R"otaliteral(
++<!DOCTYPE html><html><head><title>lidar-bot OTA</title>
++<meta name="viewport" content="width=device-width,initial-scale=1.0">
++<style>body{background:#1E212E;color:#ccd;font-family:sans-serif;text-align:center;padding:30px}
++input,button{font-size:16px;margin:8px}#bar{width:80%;max-width:420px;height:18px;background:#333;margin:14px auto;border-radius:9px;overflow:hidden}
++#fill{height:100%;width:0;background:#4a8}</style></head><body>
++<h2>lidar-bot firmware update</h2>
++<p style="font-size:13px;opacity:.7">Upload General_Driver.ino.bin (the app binary only)</p>
++<form id="f" method="POST" action="/update" enctype="multipart/form-data">
++<input type="file" name="update" accept=".bin"><br><button type="submit">FLASH</button></form>
++<div id="bar"><div id="fill"></div></div>
++<div id="msg">waiting for file</div>
++<script>
++var f=document.getElementById('f');
++f.onsubmit=function(e){e.preventDefault();
++var d=new FormData(f);var x=new XMLHttpRequest();
++x.upload.onprogress=function(ev){if(ev.lengthComputable){var p=(ev.loaded/ev.total*100).toFixed(0);
++document.getElementById('fill').style.width=p+'%';document.getElementById('msg').innerHTML='uploading '+p+'%';}};
++x.onload=function(){document.getElementById('msg').innerHTML=(x.status==200)?'OK - rebooting. Reconnect in ~10s.':'FAILED: '+x.responseText;};
++x.open('POST','/update',true);x.send(d);};
++</script></body></html>
++)otaliteral";
++
++void handleOtaPage(){
++  server.setContentLength(strlen_P(ota_html));
++  server.send_P(200, PSTR("text/html"), ota_html);
+ }
+ 
+ void webCtrlServer(){
+   server.on("/", handleRoot);
++  server.on("/ota", handleOtaPage);
++
++  // browser OTA: POST the .bin to /update
++  server.on("/update", HTTP_POST,
++    [](){
++      server.sendHeader("Connection", "close");
++      server.send(200, "text/plain", Update.hasError() ? "FAIL" : "OK");
++      delay(500);
++      ESP.restart();
++    },
++    [](){
++      HTTPUpload& up = server.upload();
++      if (up.status == UPLOAD_FILE_START) {
++        screenLine_3 = "OTA: receiving...";
++        oled_update();
++        if (!Update.begin(UPDATE_SIZE_UNKNOWN)) { Update.printError(Serial); }
++      } else if (up.status == UPLOAD_FILE_WRITE) {
++        if (Update.write(up.buf, up.currentSize) != up.currentSize) { Update.printError(Serial); }
++      } else if (up.status == UPLOAD_FILE_END) {
++        if (Update.end(true)) {
++          screenLine_3 = "OTA: done, reboot";
++        } else {
++          screenLine_3 = "OTA: FAILED";
++          Update.printError(Serial);
++        }
++        oled_update();
++      }
++    });
+ 
+   server.on("/js", [](){
+     String jsonCmdWebString = server.arg(0);
+diff --git a/General_Driver/json_cmd.h b/General_Driver/json_cmd.h
+index 1148bcf..d254131 100644
+--- a/General_Driver/json_cmd.h
++++ b/General_Driver/json_cmd.h
+@@ -572,4 +572,28 @@
+ // === === === mainType & moduleType settings. === === ===
+ // {"T":900,"main":1,"module":0}
+ // main_type: 1-WAVE ROVER, 2-UGV02, 3-UGV01
++// --- lidar-bot additions ---
++// {"T":700,"wd":0.08,"ppr":827,"tw":0.18,"dir":0,"pid":1,"save":1}
++#define CMD_ROBOT_CONFIG_SET  700
++// {"T":701}
++#define CMD_ROBOT_CONFIG_GET  701
++// {"T":702}
++#define CMD_ROBOT_CONFIG_SAVE 702
++// {"T":703}
++#define CMD_ROBOT_CONFIG_LOAD 703
++// {"T":710}  full status dump
++#define CMD_FULL_STATUS       710
++
++// --- lidar-bot additions ---
++// {"T":700,"wd":0.08,"ppr":827,"tw":0.18,"dir":0,"pid":1,"save":1}
++#define CMD_ROBOT_CONFIG_SET  700
++// {"T":701}
++#define CMD_ROBOT_CONFIG_GET  701
++// {"T":702}
++#define CMD_ROBOT_CONFIG_SAVE 702
++// {"T":703}
++#define CMD_ROBOT_CONFIG_LOAD 703
++// {"T":710}  full status dump
++#define CMD_FULL_STATUS       710
++
+ #define CMD_MM_TYPE_SET 900
+\ No newline at end of file
+diff --git a/General_Driver/movtion_module.h b/General_Driver/movtion_module.h
+index 968664d..b1b3858 100644
+--- a/General_Driver/movtion_module.h
++++ b/General_Driver/movtion_module.h
+@@ -2,6 +2,28 @@
+ int switch_pwm_A = 0;
+ int switch_pwm_B = 0;
+ bool usePIDCompute = false;
++
++// --- lidar-bot motor mapping (all runtime-settable, saved to flash) ---
++bool motorSwapLR = false;   // swap which physical port is the left wheel
++bool motorInvL   = false;   // flip left wheel direction (drive + encoder)
++bool motorInvR   = false;   // flip right wheel direction (drive + encoder)
++bool encInvL     = false;   // flip LEFT encoder only (A/B wires swapped)
++bool encInvR     = false;   // flip RIGHT encoder only
++
++// port A is the left wheel unless motorSwapLR is set
++inline bool portIsLeft(bool isPortA) { return (isPortA != motorSwapLR); }
++
++inline int portDriveSign(bool isPortA) {
++  bool L = portIsLeft(isPortA);
++  return ((L ? motorInvL : motorInvR) ? -1 : 1);
++}
++
++inline int portEncSign(bool isPortA) {
++  bool L = portIsLeft(isPortA);
++  int sg = ((L ? motorInvL : motorInvR) ? -1 : 1);
++  if (L ? encInvL : encInvR) { sg = -sg; }
++  return sg;
++}
+ float spd_rate_A = 1.0;
+ float spd_rate_B = 1.0;
+ bool heartbeatStopFlag = false;
+@@ -135,6 +157,10 @@ int lastEncoderB = 0;
+ double speedGetA;
+ double speedGetB;
+ 
++// speed is only recomputed this often; sampling every loop gives mostly-zero
++// readings (no pulses in 200us) which makes the PID wind up and run away.
++#define SPEED_SAMPLE_US 20000   // 20 ms -> 50 Hz
++
+ double plusesRate = 3.14159265359 * WHEEL_D / ONE_CIRCLE_PLUSES;
+ 
+ 
+@@ -155,13 +181,14 @@ void getWheelSpeed() {
+   long encoderPulsesA = encoderA.getCount();
+   long encoderPulsesB = encoderB.getCount();
+ 
+-  if (!SET_MOTOR_DIR) {
+-    speedGetA = (plusesRate * (encoderPulsesA - lastEncoderA)) / ((double)(currentTime - lastTime) / 1000000);
+-    speedGetB = (plusesRate * (encoderPulsesB - lastEncoderB)) / ((double)(currentTime - lastTime) / 1000000);
+-  } else {
+-    speedGetA = (plusesRate * (lastEncoderA - encoderPulsesA)) / ((double)(currentTime - lastTime) / 1000000);
+-    speedGetB = (plusesRate * (lastEncoderB - encoderPulsesB)) / ((double)(currentTime - lastTime) / 1000000);
+-  }
++  long dA = encoderPulsesA - lastEncoderA;
++  long dB = encoderPulsesB - lastEncoderB;
++  if (SET_MOTOR_DIR) { dA = -dA; dB = -dB; }
++  dA *= portEncSign(true);
++  dB *= portEncSign(false);
++  double dt = (double)(currentTime - lastTime) / 1000000;
++  speedGetA = (plusesRate * dA) / dt;
++  speedGetB = (plusesRate * dB) / dt;
+   lastEncoderA = encoderPulsesA;
+   lastEncoderB = encoderPulsesB;
+   lastTime = currentTime;
+@@ -169,24 +196,24 @@ void getWheelSpeed() {
+ 
+ void getLeftSpeed() {
+   unsigned long currentTime = micros();
++  if ((currentTime - lastLeftSpdTime) < SPEED_SAMPLE_US) { return; }
+   long encoderPulsesA = encoderA.getCount();
+-  if (!SET_MOTOR_DIR) {
+-    speedGetA = (plusesRate * (encoderPulsesA - lastEncoderA)) / ((double)(currentTime - lastLeftSpdTime) / 1000000);
+-  } else {
+-    speedGetA = (plusesRate * (lastEncoderA - encoderPulsesA)) / ((double)(currentTime - lastLeftSpdTime) / 1000000);
+-  }
++  long dA = encoderPulsesA - lastEncoderA;
++  if (SET_MOTOR_DIR) { dA = -dA; }
++  dA *= portEncSign(true);
++  speedGetA = (plusesRate * dA) / ((double)(currentTime - lastLeftSpdTime) / 1000000);
+   lastEncoderA = encoderPulsesA;
+   lastLeftSpdTime = currentTime;
+ }
+ 
+ void getRightSpeed() {
+   unsigned long currentTime = micros();
++  if ((currentTime - lastRightSpdTime) < SPEED_SAMPLE_US) { return; }
+   long encoderPulsesB = encoderB.getCount();
+-  if (!SET_MOTOR_DIR) {
+-    speedGetB = (plusesRate * (encoderPulsesB - lastEncoderB)) / ((double)(currentTime - lastRightSpdTime) / 1000000);
+-  } else {
+-    speedGetB = (plusesRate * (lastEncoderB - encoderPulsesB)) / ((double)(currentTime - lastRightSpdTime) / 1000000);
+-  }
++  long dB = encoderPulsesB - lastEncoderB;
++  if (SET_MOTOR_DIR) { dB = -dB; }
++  dB *= portEncSign(false);
++  speedGetB = (plusesRate * dB) / ((double)(currentTime - lastRightSpdTime) / 1000000);
+   lastEncoderB = encoderPulsesB;
+   lastRightSpdTime = currentTime;
+ }
+@@ -230,7 +257,7 @@ void pidControllerInit() {
+ }
+ 
+ void leftCtrl(float pwmInputA){
+-  int pwmIntA = round(pwmInputA);
++  int pwmIntA = round(pwmInputA * portDriveSign(true));
+   if (mainType != 3) {
+     speedGetA = pwmIntA;
+   }
+@@ -260,7 +287,7 @@ void leftCtrl(float pwmInputA){
+ }
+ 
+ void rightCtrl(float pwmInputB){
+-  int pwmIntB = round(pwmInputB);
++  int pwmIntB = round(pwmInputB * portDriveSign(false));
+   if (mainType != 3) {
+     speedGetB = pwmIntB;
+   }
+@@ -290,6 +317,10 @@ void rightCtrl(float pwmInputB){
+ }
+ 
+ void setGoalSpeed(float inputLeft, float inputRight) {
++  // lidar-bot: logical left/right -> physical port A/B
++  if (motorSwapLR) {
++    float sw = inputLeft; inputLeft = inputRight; inputRight = sw;
++  }
+   // setpoint_cmd_recv = millis();
+   if (mainType == 3) {
+     usePIDCompute = true;
+@@ -349,6 +380,9 @@ void LeftPidControllerCompute() {
+   if (!usePIDCompute) {
+     return;
+   }
++  static unsigned long lastLeftPidTime = 0;
++  if ((micros() - lastLeftPidTime) < SPEED_SAMPLE_US) { return; }
++  lastLeftPidTime = micros();
+ 
+   outputA = pidA.Run(speedGetA);
+   if (abs(outputA)<THRESHOLD_PWM) {
+@@ -364,6 +398,9 @@ void RightPidControllerCompute() {
+   if (!usePIDCompute) {
+     return;
+   }
++  static unsigned long lastRightPidTime = 0;
++  if ((micros() - lastRightPidTime) < SPEED_SAMPLE_US) { return; }
++  lastRightPidTime = micros();
+ 
+   outputB = pidB.Run(speedGetB);
+   if (abs(outputB)<THRESHOLD_PWM) {
+@@ -446,4 +483,16 @@ void mm_settings(byte inputMain, byte inputModule) {
+   } else if (moduleType == 2) {
+     screenLine_2 += " PT";
+   } 
+-}
+\ No newline at end of file
++}
++
++// --- lidar-bot: logical (left/right) views of the physical ports ---
++long logicalCountL() {
++  return motorSwapLR ? (encoderB.getCount() * portEncSign(false))
++                     : (encoderA.getCount() * portEncSign(true));
++}
++long logicalCountR() {
++  return motorSwapLR ? (encoderA.getCount() * portEncSign(true))
++                     : (encoderB.getCount() * portEncSign(false));
++}
++double logicalSpeedL() { return motorSwapLR ? speedGetB : speedGetA; }
++double logicalSpeedR() { return motorSwapLR ? speedGetA : speedGetB; }
+diff --git a/General_Driver/oled_ctrl.h b/General_Driver/oled_ctrl.h
+index 2e9110d..40c491b 100644
+--- a/General_Driver/oled_ctrl.h
++++ b/General_Driver/oled_ctrl.h
+@@ -11,6 +11,9 @@ String screenLine_1;
+ String screenLine_2;
+ String screenLine_3;
+ 
++// ip shown on the default screen, set by updateOledWifiInfo()
++String oledIpStr = "---";
++
+ // custom
+ String customLine_0;
+ String customLine_1;
+@@ -50,22 +53,41 @@ void oled_update() {
+   display.display();
+ }
+ 
++
++// default screen: battery percentage, battery current, ip.
++void oledDefaultInfo() {
++  if (!screenDefaultMode) {
++    return;
++  }
++
++  if (packMonitorOnline) {
++    screenLine_0 = "BAT " + String(packPercent()) + "%  " + String(packVoltage_V, 1) + "V";
++  } else {
++    screenLine_0 = "BAT --";
++  }
++
++  if (packMonitorOnline) {
++    screenLine_1 = "CUR " + String(fabs(packCurrent_mA) / 1000.0, 2) + "A";
++  } else {
++    screenLine_1 = "CUR " + String(fabs(current_mA) / 1000.0, 2) + "A";
++  }
++  screenLine_2 = "IP  " + oledIpStr;
++  screenLine_3 = packLowVoltage ? "** LOW BATTERY **" : "";
++
++  oled_update();
++}
++
+ // dev info update on oled.
+ void oledInfoUpdate() {
+   currentTimeMillis = millis();
+-  if (currentTimeMillis - lastTimeMillis > 10000) {
++  if (currentTimeMillis - lastTimeMillis > 2000) {
+     inaDataUpdate();
++    packDataUpdate();
+     lastTimeMillis = currentTimeMillis;
+   } else {
+     return;
+   }
+-  if (!screenDefaultMode) {
+-    return;
+-  }
+-  // inaDataUpdate();
+-  screenLine_3 = "V:"+String(loadVoltage_V);
+-  oled_update();
+-  
++  oledDefaultInfo();
+ }
+ 
+ // oled ctrl.
+@@ -92,7 +114,7 @@ void oledCtrl(byte inputLineNum, String inputMegs) {
+ void setOledDefault(){
+   screenDefaultMode = true;
+   inaDataUpdate();
+-  screenLine_3 = "V:"+String(loadVoltage_V);
+-  oled_update();
++  packDataUpdate();
++  oledDefaultInfo();
+   lastTimeMillis = currentTimeMillis;
+ }
+\ No newline at end of file
+diff --git a/General_Driver/uart_ctrl.h b/General_Driver/uart_ctrl.h
+index 20ebe8c..2f3d49d 100644
+--- a/General_Driver/uart_ctrl.h
++++ b/General_Driver/uart_ctrl.h
+@@ -53,6 +53,16 @@ void jsonCmdReceiveHandler(){
+ 												jsonCmdReceive["z"]);break;
+ 	case CMD_BASE_FEEDBACK:
+ 												baseInfoFeedback();break;
++	case CMD_ROBOT_CONFIG_SET:
++												setRobotConfig();break;
++	case CMD_ROBOT_CONFIG_GET:
++												getRobotConfig();break;
++	case CMD_ROBOT_CONFIG_SAVE:
++												saveRobotConfigCmd();break;
++	case CMD_ROBOT_CONFIG_LOAD:
++												loadRobotConfigCmd();break;
++	case CMD_FULL_STATUS:
++												getFullStatus();break;
+ 	case CMD_BASE_FEEDBACK_FLOW:
+ 												setBaseInfoFeedbackMode(
+ 												jsonCmdReceive["cmd"]);break;
+diff --git a/General_Driver/ugv_advance.h b/General_Driver/ugv_advance.h
+index 60531ae..58d4ddd 100644
+--- a/General_Driver/ugv_advance.h
++++ b/General_Driver/ugv_advance.h
+@@ -383,8 +383,12 @@ void baseInfoFeedback() {
+ 	jsonInfoHttp.clear();
+ 	jsonInfoHttp["T"] = FEEDBACK_BASE_INFO;
+ 
+-	jsonInfoHttp["L"] = speedGetA;
+-	jsonInfoHttp["R"] = speedGetB;
++	jsonInfoHttp["L"] = logicalSpeedL();
++	jsonInfoHttp["R"] = logicalSpeedR();
++	jsonInfoHttp["sL"] = motorSwapLR ? setpointB : setpointA;
++	jsonInfoHttp["sR"] = motorSwapLR ? setpointA : setpointB;
++	jsonInfoHttp["odl"] = logicalCountL();
++	jsonInfoHttp["odr"] = logicalCountR();
+ 
+ 	jsonInfoHttp["r"] = icm_roll;
+ 	jsonInfoHttp["p"] = icm_pitch;
+@@ -397,8 +401,12 @@ void baseInfoFeedback() {
+ 	// jsonInfoHttp["q3"] = qz;
+ 
+ 	jsonInfoHttp["temp"] = temp;
++	jsonInfoHttp["gz"] = gz;   // raw gyro Z (deg/s) - the heading source for odometry
+ 
+ 	jsonInfoHttp["v"] = loadVoltage_V;
++	jsonInfoHttp["pv"] = packVoltage_V;
++	jsonInfoHttp["pa"] = packCurrent_mA;
++	jsonInfoHttp["lowBat"] = packLowVoltage;
+ 
+ 	switch(moduleType) {
+ 	case 1:
+diff --git a/General_Driver/ugv_config.h b/General_Driver/ugv_config.h
+index f59a8b4..09347f5 100644
+--- a/General_Driver/ugv_config.h
++++ b/General_Driver/ugv_config.h
+@@ -6,7 +6,7 @@
+ // 2: flow feedback.
+ // 1: [default]print debug info in serial.
+ // 0: don't print debug info in serial.
+-byte InfoPrint = 1;
++byte InfoPrint = 0;   // 0 = clean JSON only (the Pi parses this line). {"T":605,"cmd":1} re-enables debug.
+ 
+ // devices info:
+ // espNowMode: 0 - none
+@@ -48,7 +48,7 @@ bool steadyMode = false;
+ 
+ // 0: turn off base info feedback flow.
+ // 1: [default] turn on base info feedback flow.
+-bool baseFeedbackFlow = 0;
++bool baseFeedbackFlow = 1;
+ 
+ String thisMacStr;
+ 
+@@ -314,9 +314,9 @@ String jsonFeedbackWeb = "";
+ 
+ //  --- --- --- pid controller --- --- ---
+ 
+-float __kp = 20.0;
+-float __ki = 2000.0;
+-float __kd = 0;
++float __kp = 200.0;
++float __ki = 400.0;
++float __kd = 0;   // tune live with {"T":2,"P":200,"I":400,"D":0,"L":255}
+ float windup_limits = 255;
+ 
+ 
+@@ -356,7 +356,7 @@ int IO5_CH = 8;
+ 
+ const uint16_t FREQ = 200;
+ 
+-int feedbackFlowExtraDelay = 0;
++int feedbackFlowExtraDelay = 40;   // ms between feedback lines (~25 Hz, safe at 115200 over the hat UART)
+ bool uartCmdEcho = 1;
+ 
+ #define GIMBAL_PAN_ID  2
+diff --git a/General_Driver/web_page.h b/General_Driver/web_page.h
+index b245f20..39b1c23 100644
+--- a/General_Driver/web_page.h
++++ b/General_Driver/web_page.h
+@@ -618,6 +618,225 @@ const char index_html[] PROGMEM = R"rawliteral(
+                 </div>
+             </div>
+         </section>
++        <section>
++            <div class="fb-info">
++                <h2 class="h2-tt">Encoder &amp; Motor Test</h2>
++                <span style="font-size:12px;opacity:0.7">Demo rig — values are only meaningful once PPR and wheel diameter below are real.</span>
++            </div>
++
++            <div style="max-width:760px;margin:12px auto;padding:12px;background:rgba(94,98,112,0.25);border-radius:10px;">
++
++                <div style="display:flex;flex-wrap:wrap;justify-content:center;gap:14px;margin-bottom:10px;">
++                    <div style="min-width:110px"><div style="font-size:26px;color:#fff" id="encRawL">0</div><div style="font-size:11px">RAW COUNT L</div></div>
++                    <div style="min-width:110px"><div style="font-size:26px;color:#fff" id="encRawR">0</div><div style="font-size:11px">RAW COUNT R</div></div>
++                    <div style="min-width:110px"><div style="font-size:26px;color:#8ad" id="encDeltaL">0</div><div style="font-size:11px">&Delta; SINCE ZERO L</div></div>
++                    <div style="min-width:110px"><div style="font-size:26px;color:#8ad" id="encDeltaR">0</div><div style="font-size:11px">&Delta; SINCE ZERO R</div></div>
++                </div>
++
++                <div style="display:flex;flex-wrap:wrap;justify-content:center;gap:14px;margin-bottom:10px;">
++                    <div style="min-width:110px"><div style="font-size:20px;color:#fff" id="encSpdL">0.00</div><div style="font-size:11px">SPEED L</div></div>
++                    <div style="min-width:110px"><div style="font-size:20px;color:#fff" id="encSpdR">0.00</div><div style="font-size:11px">SPEED R</div></div>
++                    <div style="min-width:110px"><div style="font-size:20px;color:#fff" id="encDirL">--</div><div style="font-size:11px">DIR L</div></div>
++                    <div style="min-width:110px"><div style="font-size:20px;color:#fff" id="encDirR">--</div><div style="font-size:11px">DIR R</div></div>
++                </div>
++
++                <div style="display:flex;flex-wrap:wrap;justify-content:center;gap:14px;margin-bottom:12px;">
++                    <div style="min-width:110px"><div style="font-size:20px;color:#9c8" id="encRevL">0.000</div><div style="font-size:11px">REVS L</div></div>
++                    <div style="min-width:110px"><div style="font-size:20px;color:#9c8" id="encRevR">0.000</div><div style="font-size:11px">REVS R</div></div>
++                    <div style="min-width:110px"><div style="font-size:20px;color:#9c8" id="encDistL">0.0</div><div style="font-size:11px">DIST L (mm)</div></div>
++                    <div style="min-width:110px"><div style="font-size:20px;color:#9c8" id="encDistR">0.0</div><div style="font-size:11px">DIST R (mm)</div></div>
++                    <div style="min-width:130px"><div style="font-size:20px;color:#fc9" id="encDistAvg">0.0</div><div style="font-size:11px">ROBOT DIST (mm)</div></div>
++                </div>
++
++                <div style="display:flex;flex-wrap:wrap;justify-content:center;gap:10px;align-items:center;margin-bottom:12px;">
++                    <label style="font-size:12px">PULSES / WHEEL REV
++                        <input type="number" id="encPPR" value="827" style="width:90px;margin-left:6px" oninput="encRecalc();">
++                    </label>
++                    <label style="font-size:12px">WHEEL DIA (mm)
++                        <input type="number" id="encDia" value="80" style="width:80px;margin-left:6px" oninput="encRecalc();">
++                    </label>
++                    <button class="w-btn" onclick="encZero();">ZERO</button>
++                </div>
++
++                <hr style="border-color:rgba(255,255,255,0.15)">
++
++                <div style="margin:10px 0;">
++                    <div style="font-size:12px;margin-bottom:6px">CALIBRATE PULSES / REV &mdash; press ZERO, turn the wheel by hand exactly N turns, then COMPUTE</div>
++                    <label style="font-size:12px">TURNS
++                        <input type="number" id="encTurns" value="10" style="width:70px;margin-left:6px">
++                    </label>
++                    <button class="w-btn" onclick="encComputePPR('L');">COMPUTE FROM L</button>
++                    <button class="w-btn" onclick="encComputePPR('R');">COMPUTE FROM R</button>
++                </div>
++
++                <hr style="border-color:rgba(255,255,255,0.15)">
++
++                <div style="margin:10px 0;">
++                    <div style="font-size:12px;margin-bottom:6px">MOTOR TEST &mdash; runs for the set duration then stops automatically</div>
++                    <label style="font-size:12px">SPEED
++                        <input type="number" id="encSpd" value="0.2" step="0.05" style="width:70px;margin-left:6px">
++                    </label>
++                    <label style="font-size:12px">SECONDS
++                        <input type="number" id="encDur" value="2" step="0.5" style="width:70px;margin-left:6px">
++                    </label>
++                    <div style="margin-top:8px;display:flex;flex-wrap:wrap;justify-content:center;gap:6px;">
++                        <button class="w-btn" onclick="encTest('LF');">LEFT FWD</button>
++                        <button class="w-btn" onclick="encTest('RF');">RIGHT FWD</button>
++                        <button class="w-btn" onclick="encTest('BF');">BOTH FWD</button>
++                        <button class="w-btn" onclick="encTest('BR');">BOTH REV</button>
++                        <button class="w-btn" onclick="encTest('SC');">SPIN CW</button>
++                        <button class="w-btn" onclick="encTest('SA');">SPIN CCW</button>
++                        <button class="w-btn" style="background:#a33" onclick="encStop();">STOP</button>
++                    </div>
++                </div>
++
++                <div id="encStatus" style="font-size:12px;margin-top:10px;min-height:34px;color:#cde">Ready. Expected: FWD makes both counts rise. If one falls, swap that motor's A/B encoder wires.</div>
++            </div>
++        </section>
++        <section>
++            <div class="fb-info">
++                <h2 class="h2-tt">Robot Configurator</h2>
++                <span style="font-size:12px;opacity:0.7">Stored in flash on the board &mdash; survives reboot, and the Pi reads the same values.</span>
++            </div>
++
++            <div style="max-width:760px;margin:12px auto;padding:12px;background:rgba(94,98,112,0.25);border-radius:10px;">
++
++                <div style="display:flex;flex-wrap:wrap;justify-content:center;gap:12px;align-items:center;">
++                    <label style="font-size:12px">WHEEL DIA (mm)
++                        <input type="number" id="cfgDia" value="80" step="0.1" style="width:90px;margin-left:6px" oninput="cfgDerive();">
++                    </label>
++                    <label style="font-size:12px">PULSES / REV
++                        <input type="number" id="cfgPPR" value="827" style="width:90px;margin-left:6px" oninput="cfgDerive();">
++                    </label>
++                    <label style="font-size:12px">TRACK WIDTH (mm)
++                        <input type="number" id="cfgTW" value="180" step="0.1" style="width:90px;margin-left:6px" oninput="cfgDerive();">
++                    </label>
++                </div>
++
++                <div style="display:flex;flex-wrap:wrap;justify-content:center;gap:14px;align-items:center;margin-top:12px;padding-top:10px;border-top:1px solid rgba(255,255,255,0.12);">
++                    <label style="font-size:12px"><input type="checkbox" id="cfgSwap"> SWAP L/R MOTORS</label>
++                    <label style="font-size:12px"><input type="checkbox" id="cfgInvL"> INVERT LEFT</label>
++                    <label style="font-size:12px"><input type="checkbox" id="cfgInvR"> INVERT RIGHT</label>
++                </div>
++                <div style="display:flex;flex-wrap:wrap;justify-content:center;gap:14px;align-items:center;margin-top:8px;">
++                    <label style="font-size:12px"><input type="checkbox" id="cfgEncL"> FLIP LEFT ENCODER</label>
++                    <label style="font-size:12px"><input type="checkbox" id="cfgEncR"> FLIP RIGHT ENCODER</label>
++                    <label style="font-size:12px">CONTROL
++                        <select id="cfgMode" style="margin-left:6px">
++                            <option value="3">CLOSED LOOP (PID)</option>
++                            <option value="1">OPEN LOOP</option>
++                        </select>
++                    </label>
++                </div>
++                <div style="font-size:11px;opacity:0.65;margin-top:8px;max-width:620px;margin-left:auto;margin-right:auto;text-align:left">
++                    SWAP = the ports are wired the other way round. INVERT = that wheel drives the wrong way (flips drive and its encoder together).
++                    FLIP ENCODER = the wheel drives correctly but counts backwards (A/B wires swapped) &mdash; if PID runs away, this is the one.
++                </div>
++
++                <div style="display:flex;flex-wrap:wrap;justify-content:center;gap:14px;margin:12px 0;">
++                    <div style="min-width:140px"><div style="font-size:18px;color:#9c8" id="cfgPerPulse">0.000</div><div style="font-size:11px">mm PER PULSE</div></div>
++                    <div style="min-width:140px"><div style="font-size:18px;color:#9c8" id="cfgPerMetre">0</div><div style="font-size:11px">PULSES PER METRE</div></div>
++                    <div style="min-width:140px"><div style="font-size:18px;color:#9c8" id="cfgPerSpin">0</div><div style="font-size:11px">PULSES PER 360&deg; SPIN</div></div>
++                </div>
++
++                <div style="display:flex;flex-wrap:wrap;justify-content:center;gap:6px;">
++                    <button class="w-btn" onclick="cfgRead();">READ FROM BOARD</button>
++                    <button class="w-btn" onclick="cfgCopyPPR();">USE PPR FROM ENCODER TEST</button>
++                    <button class="w-btn" onclick="cfgApply(0);">APPLY (RAM)</button>
++                    <button class="w-btn" style="background:#284" onclick="cfgApply(1);">SAVE TO FLASH</button>
++                </div>
++
++                <div id="cfgStatus" style="font-size:12px;margin-top:10px;min-height:20px;color:#cde">Press READ FROM BOARD to load the live values.</div>
++            </div>
++        </section>
++
++        <section>
++            <div class="fb-info">
++                <h2 class="h2-tt">Waypoint Planner (test)</h2>
++                <span style="font-size:12px;opacity:0.7">Closed-loop on encoder counts &mdash; use it to check the geometry above is right.</span>
++            </div>
++
++            <div style="max-width:760px;margin:12px auto;padding:12px;background:rgba(94,98,112,0.25);border-radius:10px;">
++
++                <div style="display:flex;flex-wrap:wrap;justify-content:center;gap:10px;align-items:center;margin-bottom:10px;">
++                    <label style="font-size:12px">FORWARD (mm)
++                        <input type="number" id="wpFwd" value="500" style="width:80px;margin-left:6px">
++                    </label>
++                    <button class="w-btn" onclick="wpAdd('F');">ADD MOVE</button>
++                    <label style="font-size:12px">TURN (&deg;, + = right)
++                        <input type="number" id="wpTurn" value="90" style="width:80px;margin-left:6px">
++                    </label>
++                    <button class="w-btn" onclick="wpAdd('T');">ADD TURN</button>
++                </div>
++
++                <div style="display:flex;flex-wrap:wrap;justify-content:center;gap:6px;margin-bottom:10px;">
++                    <button class="w-btn" onclick="wpPreset('square');">PRESET: 1m SQUARE</button>
++                    <button class="w-btn" onclick="wpPreset('spin');">PRESET: 360&deg; SPIN</button>
++                    <button class="w-btn" onclick="wpPreset('line');">PRESET: 1m STRAIGHT</button>
++                    <button class="w-btn" onclick="wpClear();">CLEAR</button>
++                </div>
++
++                <div id="wpList" style="font-size:12px;text-align:left;max-width:420px;margin:0 auto 10px auto;min-height:40px;background:rgba(0,0,0,0.2);padding:8px;border-radius:6px;">No steps.</div>
++
++                <div style="display:flex;flex-wrap:wrap;justify-content:center;gap:10px;align-items:center;">
++                    <label style="font-size:12px">SPEED
++                        <input type="number" id="wpSpd" value="0.15" step="0.05" style="width:70px;margin-left:6px">
++                    </label>
++                    <button class="w-btn" style="background:#284" onclick="wpRun();">RUN</button>
++                    <button class="w-btn" style="background:#a33" onclick="wpAbort();">STOP</button>
++                </div>
++
++                <div id="wpStatus" style="font-size:12px;margin-top:10px;min-height:34px;color:#cde">Idle. Tip: run 1m STRAIGHT and measure with a tape &mdash; if it overshoots, the wheel diameter is too small. Run 360&deg; SPIN &mdash; if it over-rotates, the track width is too small.</div>
++            </div>
++        </section>
++        <section>
++            <div class="fb-info">
++                <h2 class="h2-tt">PID Tuner</h2>
++                <span style="font-size:12px;opacity:0.7">Wheels off the ground. Step test, read the metrics, adjust, repeat.</span>
++            </div>
++
++            <div style="max-width:760px;margin:12px auto;padding:12px;background:rgba(94,98,112,0.25);border-radius:10px;">
++
++                <canvas id="pidPlot" width="720" height="220" style="width:100%;max-width:720px;background:#11131b;border-radius:8px;"></canvas>
++                <div style="font-size:11px;margin-top:4px;">
++                    <span style="color:#6cf">&#9632;</span> setpoint L
++                    <span style="color:#fff;margin-left:10px">&#9632;</span> measured L
++                    <span style="color:#f96;margin-left:10px">&#9632;</span> setpoint R
++                    <span style="color:#9c8;margin-left:10px">&#9632;</span> measured R
++                </div>
++
++                <div style="display:flex;flex-wrap:wrap;justify-content:center;gap:10px;align-items:center;margin:12px 0;">
++                    <label style="font-size:12px">P <input type="number" id="pidP" value="200" step="10" style="width:80px;margin-left:4px"></label>
++                    <label style="font-size:12px">I <input type="number" id="pidI" value="400" step="25" style="width:80px;margin-left:4px"></label>
++                    <label style="font-size:12px">D <input type="number" id="pidD" value="0" step="1" style="width:70px;margin-left:4px"></label>
++                    <label style="font-size:12px">LIMIT <input type="number" id="pidLim" value="255" step="5" style="width:70px;margin-left:4px"></label>
++                    <button class="w-btn" onclick="pidApply(0);">APPLY</button>
++                    <button class="w-btn" style="background:#284" onclick="pidApply(1);">SAVE</button>
++                    <button class="w-btn" onclick="pidReadCfg();">READ</button>
++                </div>
++
++                <div style="display:flex;flex-wrap:wrap;justify-content:center;gap:10px;align-items:center;margin-bottom:10px;">
++                    <label style="font-size:12px">TARGET (m/s) <input type="number" id="pidTarget" value="0.2" step="0.05" style="width:75px;margin-left:4px"></label>
++                    <label style="font-size:12px">HOLD (s) <input type="number" id="pidHold" value="2" step="0.5" style="width:70px;margin-left:4px"></label>
++                    <button class="w-btn" style="background:#284" onclick="pidStep();">STEP TEST</button>
++                    <button class="w-btn" style="background:#446;font-weight:bold" onclick="autoStart();">AUTO-TUNE</button>
++                    <button class="w-btn" onclick="autoAbort();">ABORT AUTO</button>
++                    <button class="w-btn" onclick="pidLiveToggle();" id="pidLiveBtn">LIVE: OFF</button>
++                    <button class="w-btn" style="background:#a33" onclick="pidStop();">STOP</button>
++                </div>
++
++                <div style="display:flex;flex-wrap:wrap;justify-content:center;gap:6px;margin-bottom:10px;">
++                    <button class="w-btn" onclick="pidPreset('safe');">PRESET: SAFE START</button>
++                    <button class="w-btn" onclick="pidPreset('ponly');">P ONLY</button>
++                    <button class="w-btn" onclick="pidPreset('halveI');">HALVE I</button>
++                    <button class="w-btn" onclick="pidPreset('doubleI');">DOUBLE I</button>
++                </div>
++
++                <div id="pidMetrics" style="font-size:12px;text-align:left;max-width:620px;margin:0 auto;background:rgba(0,0,0,0.25);padding:10px;border-radius:6px;min-height:60px;color:#cde">
++                    Run a STEP TEST to measure rise time, overshoot and steady-state error.
++                </div>
++            </div>
++        </section>
+     </main>
+ <script>
+     var cmdA;
+@@ -1028,6 +1247,845 @@ const char index_html[] PROGMEM = R"rawliteral(
+         last_rightButton = rightButton;
+         last_lrNewer = lrNewer;
+     }
++    // --- --- --- encoder & motor test --- --- ---
++    var encZeroL = 0, encZeroR = 0;
++    var encLastL = 0, encLastR = 0;
++    var encTestTimer = null;
++    var encTestTag = "";
++    var encTestStartL = 0, encTestStartR = 0;
++
++    function encPoll() {
++        var jsonString = JSON.stringify({"T":130});
++        var xhttp = new XMLHttpRequest();
++        xhttp.onreadystatechange = function() {
++            if (this.readyState == 4 && this.status == 200) {
++                var r;
++                try { r = JSON.parse(this.responseText); } catch(e) { return; }
++                if (!r.hasOwnProperty('odl')) { return; }
++
++                var dirL = r.odl - encLastL;
++                var dirR = r.odr - encLastR;
++                encLastL = r.odl;
++                encLastR = r.odr;
++
++                document.getElementById("encRawL").innerHTML = r.odl;
++                document.getElementById("encRawR").innerHTML = r.odr;
++                document.getElementById("encSpdL").innerHTML = (r.L || 0).toFixed(2);
++                document.getElementById("encSpdR").innerHTML = (r.R || 0).toFixed(2);
++                document.getElementById("encDirL").innerHTML = dirL > 0 ? "&uarr; FWD" : (dirL < 0 ? "&darr; REV" : "--");
++                document.getElementById("encDirR").innerHTML = dirR > 0 ? "&uarr; FWD" : (dirR < 0 ? "&darr; REV" : "--");
++
++                encRecalc();
++            }
++        };
++        xhttp.open("GET", "js?json=" + jsonString, true);
++        xhttp.send();
++    }
++
++    function encRecalc() {
++        var ppr = parseFloat(document.getElementById("encPPR").value) || 1;
++        var dia = parseFloat(document.getElementById("encDia").value) || 0;
++        var circ = Math.PI * dia;
++
++        var dL = encLastL - encZeroL;
++        var dR = encLastR - encZeroR;
++        var revL = dL / ppr;
++        var revR = dR / ppr;
++
++        document.getElementById("encDeltaL").innerHTML = dL;
++        document.getElementById("encDeltaR").innerHTML = dR;
++        document.getElementById("encRevL").innerHTML = revL.toFixed(3);
++        document.getElementById("encRevR").innerHTML = revR.toFixed(3);
++        document.getElementById("encDistL").innerHTML = (revL * circ).toFixed(1);
++        document.getElementById("encDistR").innerHTML = (revR * circ).toFixed(1);
++        document.getElementById("encDistAvg").innerHTML = (((revL + revR) / 2) * circ).toFixed(1);
++    }
++
++    function encZero() {
++        encZeroL = encLastL;
++        encZeroR = encLastR;
++        encRecalc();
++        document.getElementById("encStatus").innerHTML = "Zeroed.";
++    }
++
++    function encComputePPR(side) {
++        var turns = parseFloat(document.getElementById("encTurns").value) || 0;
++        if (turns == 0) { return; }
++        var d = (side == "L") ? (encLastL - encZeroL) : (encLastR - encZeroR);
++        var ppr = Math.abs(d / turns);
++        if (ppr < 1) {
++            document.getElementById("encStatus").innerHTML =
++                "Not enough movement to calibrate &mdash; press ZERO, turn the wheel, then COMPUTE.";
++            return;
++        }
++        document.getElementById("encPPR").value = Math.round(ppr);
++        encRecalc();
++        document.getElementById("encStatus").innerHTML =
++            "Wheel " + side + ": " + Math.abs(d) + " counts over " + turns +
++            " turns = <b>" + Math.round(ppr) + "</b> pulses/rev. Put this in ONE_CIRCLE_PLUSES.";
++    }
++
++    function encDrive(l, r) {
++        left_speed = l;
++        right_speed = r;
++        send_heartbeat = 1;
++        var jsonString = JSON.stringify({"T":1,"L":l,"R":r});
++        var xhr = new XMLHttpRequest();
++        xhr.open("GET", "js?json=" + jsonString, true);
++        xhr.send();
++    }
++
++    function encStop() {
++        if (encTestTimer) { clearTimeout(encTestTimer); encTestTimer = null; }
++        left_speed = 0;
++        right_speed = 0;
++        send_heartbeat = 0;
++        var jsonString = JSON.stringify({"T":1,"L":0,"R":0});
++        var xhr = new XMLHttpRequest();
++        xhr.open("GET", "js?json=" + jsonString, true);
++        xhr.send();
++    }
++
++    function encTest(mode) {
++        var s = parseFloat(document.getElementById("encSpd").value) || 0;
++        var secs = parseFloat(document.getElementById("encDur").value) || 1;
++        var l = 0, r = 0;
++        if (mode == "LF") { l = s;  r = 0;  }
++        if (mode == "RF") { l = 0;  r = s;  }
++        if (mode == "BF") { l = s;  r = s;  }
++        if (mode == "BR") { l = -s; r = -s; }
++        if (mode == "SC") { l = s;  r = -s; }
++        if (mode == "SA") { l = -s; r = s;  }
++
++        encTestTag = mode;
++        encTestStartL = encLastL;
++        encTestStartR = encLastR;
++
++        if (encTestTimer) { clearTimeout(encTestTimer); }
++        encDrive(l, r);
++        document.getElementById("encStatus").innerHTML = "Running " + mode + " at " + s + " for " + secs + "s...";
++
++        encTestTimer = setTimeout(function() {
++            encStop();
++            setTimeout(encTestReport, 400);
++        }, secs * 1000);
++    }
++
++    function encTestReport() {
++        var dL = encLastL - encTestStartL;
++        var dR = encLastR - encTestStartR;
++        var msg = "Test " + encTestTag + " done. &Delta;L = " + dL + ", &Delta;R = " + dR + ". ";
++
++        if (encTestTag == "BF" || encTestTag == "BR") {
++            var want = (encTestTag == "BF") ? 1 : -1;
++            var okL = (dL * want) > 0;
++            var okR = (dR * want) > 0;
++            if (!okL && !okR) {
++                msg += "Both wheels counted the wrong way &mdash; swap A/B on both encoders.";
++            } else if (!okL) {
++                msg += "LEFT counted backwards &mdash; swap left encoder A/B (or its motor wires if the wheel span the wrong way).";
++            } else if (!okR) {
++                msg += "RIGHT counted backwards &mdash; swap right encoder A/B (or its motor wires if the wheel span the wrong way).";
++            } else {
++                var ratio = (Math.abs(dR) > 0) ? Math.abs(dL) / Math.abs(dR) : 0;
++                msg += "Both correct. L/R match = " + ratio.toFixed(2) +
++                       (Math.abs(ratio - 1) < 0.15 ? " (good)" : " (mismatched &mdash; check load or PID)");
++            }
++        } else if (encTestTag == "LF") {
++            msg += (Math.abs(dR) > Math.abs(dL) * 0.2 && Math.abs(dL) > 0)
++                 ? "RIGHT moved too &mdash; motor ports may be crossed."
++                 : (dL > 0 ? "Left OK." : (dL < 0 ? "Left counts backwards." : "Left did not move."));
++        } else if (encTestTag == "RF") {
++            msg += (Math.abs(dL) > Math.abs(dR) * 0.2 && Math.abs(dR) > 0)
++                 ? "LEFT moved too &mdash; motor ports may be crossed."
++                 : (dR > 0 ? "Right OK." : (dR < 0 ? "Right counts backwards." : "Right did not move."));
++        }
++        document.getElementById("encStatus").innerHTML = msg;
++    }
++
++    setInterval(function() {
++        encPoll();
++    }, 300);
++    // --- --- --- robot configurator --- --- ---
++    function cfgDerive() {
++        var dia = parseFloat(document.getElementById("cfgDia").value) || 0;
++        var ppr = parseFloat(document.getElementById("cfgPPR").value) || 1;
++        var tw  = parseFloat(document.getElementById("cfgTW").value)  || 0;
++        var circ = Math.PI * dia;
++        var perPulse = circ / ppr;
++        document.getElementById("cfgPerPulse").innerHTML = perPulse.toFixed(4);
++        document.getElementById("cfgPerMetre").innerHTML = (1000 / perPulse).toFixed(0);
++        document.getElementById("cfgPerSpin").innerHTML  = ((Math.PI * tw) / perPulse).toFixed(0);
++    }
++
++    function cfgRead() {
++        var xhr = new XMLHttpRequest();
++        xhr.onreadystatechange = function() {
++            if (this.readyState == 4 && this.status == 200) {
++                var r;
++                try { r = JSON.parse(this.responseText); } catch(e) { return; }
++                document.getElementById("cfgDia").value = (r.wd * 1000).toFixed(1);
++                document.getElementById("cfgPPR").value = r.ppr;
++                document.getElementById("cfgTW").value  = (r.tw * 1000).toFixed(1);
++                document.getElementById("cfgSwap").checked = !!r.swap;
++                document.getElementById("cfgInvL").checked = !!r.invL;
++                document.getElementById("cfgInvR").checked = !!r.invR;
++                document.getElementById("cfgEncL").checked = !!r.encL;
++                document.getElementById("cfgEncR").checked = !!r.encR;
++                document.getElementById("cfgMode").value = r.mt;
++                cfgDerive();
++                document.getElementById("cfgStatus").innerHTML =
++                    "Read from board. Source: " + (r.saved ? "saved config in flash" : "built-in defaults") + ".";
++            }
++        };
++        xhr.open("GET", "js?json=" + JSON.stringify({"T":701}), true);
++        xhr.send();
++    }
++
++    function cfgCopyPPR() {
++        document.getElementById("cfgPPR").value = document.getElementById("encPPR").value;
++        cfgDerive();
++        document.getElementById("cfgStatus").innerHTML = "Pulses/rev copied from the encoder test above.";
++    }
++
++    function cfgApply(save) {
++        var cmd = {
++            "T": 700,
++            "wd": (parseFloat(document.getElementById("cfgDia").value) || 0) / 1000,
++            "ppr": parseInt(document.getElementById("cfgPPR").value) || 1,
++            "tw": (parseFloat(document.getElementById("cfgTW").value) || 0) / 1000,
++            "mt": parseInt(document.getElementById("cfgMode").value),
++            "swap": document.getElementById("cfgSwap").checked ? 1 : 0,
++            "invL": document.getElementById("cfgInvL").checked ? 1 : 0,
++            "invR": document.getElementById("cfgInvR").checked ? 1 : 0,
++            "encL": document.getElementById("cfgEncL").checked ? 1 : 0,
++            "encR": document.getElementById("cfgEncR").checked ? 1 : 0,
++            "save": save
++        };
++        var xhr = new XMLHttpRequest();
++        xhr.onreadystatechange = function() {
++            if (this.readyState == 4 && this.status == 200) {
++                var r;
++                try { r = JSON.parse(this.responseText); } catch(e) { return; }
++                document.getElementById("cfgStatus").innerHTML = save
++                    ? (r.saved ? "Saved to flash. Survives reboot." : "Applied, but the flash write FAILED.")
++                    : "Applied to RAM only &mdash; lost on reboot unless you SAVE.";
++                document.getElementById("encPPR").value = r.ppr;
++                document.getElementById("encDia").value = (r.wd * 1000).toFixed(1);
++                encRecalc();
++            }
++        };
++        xhr.open("GET", "js?json=" + JSON.stringify(cmd), true);
++        xhr.send();
++    }
++
++    // --- --- --- waypoint planner --- --- ---
++    var wpSteps = [];
++    var wpIdx = 0;
++    var wpTimer = null;
++    var wpStartL = 0, wpStartR = 0, wpTarget = 0, wpDeadline = 0;
++    var wpRunning = false;
++    var wpPaused = false;
++    var wpLog = [];
++
++    function wpRender() {
++        var el = document.getElementById("wpList");
++        if (wpSteps.length == 0) { el.innerHTML = "No steps."; return; }
++        var out = "";
++        for (var i = 0; i < wpSteps.length; i++) {
++            var s = wpSteps[i];
++            out += (i + 1) + ". " + (s.type == "F" ? ("FORWARD " + s.val + " mm") : ("TURN " + s.val + "&deg;"))
++                 + (i == wpIdx && wpRunning ? "  &larr; running" : "") + "<br>";
++        }
++        el.innerHTML = out;
++    }
++
++    function wpAdd(type) {
++        var v = (type == "F")
++            ? (parseFloat(document.getElementById("wpFwd").value) || 0)
++            : (parseFloat(document.getElementById("wpTurn").value) || 0);
++        if (v == 0) { return; }
++        wpSteps.push({type: type, val: v});
++        wpRender();
++    }
++
++    function wpClear() { wpAbort(); wpSteps = []; wpRender(); }
++
++    function wpPreset(name) {
++        wpAbort();
++        wpSteps = [];
++        if (name == "square") {
++            for (var i = 0; i < 4; i++) {
++                wpSteps.push({type:"F", val:1000});
++                wpSteps.push({type:"T", val:90});
++            }
++        } else if (name == "spin") {
++            wpSteps.push({type:"T", val:360});
++        } else if (name == "line") {
++            wpSteps.push({type:"F", val:1000});
++        }
++        wpRender();
++    }
++
++    // counts needed for a step, using the values in the configurator
++    function wpTargetCounts(step) {
++        var dia = parseFloat(document.getElementById("cfgDia").value) || 1;
++        var ppr = parseFloat(document.getElementById("cfgPPR").value) || 1;
++        var tw  = parseFloat(document.getElementById("cfgTW").value)  || 1;
++        var circ = Math.PI * dia;
++        if (step.type == "F") {
++            return Math.abs(step.val) / circ * ppr;
++        }
++        var arc = Math.PI * tw * (Math.abs(step.val) / 360);
++        return arc / circ * ppr;
++    }
++
++    function wpBeginStep() {
++        if (wpIdx >= wpSteps.length) { wpFinish("All steps complete."); return; }
++
++        var step = wpSteps[wpIdx];
++        var s = parseFloat(document.getElementById("wpSpd").value) || 0.15;
++        wpTarget = wpTargetCounts(step);
++        wpStartL = encLastL;
++        wpStartR = encLastR;
++
++        var l, r;
++        if (step.type == "F") {
++            var sign = step.val >= 0 ? 1 : -1;
++            l = s * sign; r = s * sign;
++        } else {
++            var sign2 = step.val >= 0 ? 1 : -1;   // + = right / clockwise
++            l = s * sign2; r = -s * sign2;
++        }
++
++        // generous timeout so a stall can't run forever
++        var dia2 = parseFloat(document.getElementById("cfgDia").value) || 1;
++        var ppr2 = parseFloat(document.getElementById("cfgPPR").value) || 1;
++        var metres = wpTarget * (Math.PI * dia2 / ppr2) / 1000;
++        var estMs = (metres / Math.max(0.02, s)) * 1000 * 3 + 3000;
++        wpDeadline = Date.now() + Math.min(60000, estMs);
++
++        encDrive(l, r);
++        wpRender();
++        document.getElementById("wpStatus").innerHTML =
++            "Step " + (wpIdx + 1) + "/" + wpSteps.length + ": " +
++            (step.type == "F" ? ("forward " + step.val + " mm") : ("turn " + step.val + "&deg;")) +
++            " &mdash; target " + wpTarget.toFixed(0) + " counts";
++    }
++
++    function wpTick() {
++        if (!wpRunning || wpPaused) { return; }
++
++        var dL = Math.abs(encLastL - wpStartL);
++        var dR = Math.abs(encLastR - wpStartR);
++        var prog = (dL + dR) / 2;
++
++        if (prog >= wpTarget || Date.now() > wpDeadline) {
++            var timedOut = prog < wpTarget;
++            encStop();
++            wpLog.push({
++                step: wpIdx + 1,
++                want: Math.round(wpTarget),
++                got: Math.round(prog),
++                timedOut: timedOut
++            });
++            wpIdx++;
++            wpPaused = true;
++            setTimeout(function() {
++                if (wpRunning) { wpPaused = false; wpBeginStep(); }
++            }, 600);
++        }
++    }
++
++    function wpRun() {
++        if (wpSteps.length == 0) {
++            document.getElementById("wpStatus").innerHTML = "Add a step or pick a preset first.";
++            return;
++        }
++        wpAbort();
++        wpIdx = 0;
++        wpLog = [];
++        wpRunning = true;
++        wpPaused = false;
++        wpBeginStep();
++        wpTimer = setInterval(wpTick, 120);
++    }
++
++    function wpAbort() {
++        wpRunning = false;
++        wpPaused = false;
++        if (wpTimer) { clearInterval(wpTimer); wpTimer = null; }
++        encStop();
++        wpRender();
++    }
++
++    function wpFinish(msg) {
++        wpRunning = false;
++        wpPaused = false;
++        if (wpTimer) { clearInterval(wpTimer); wpTimer = null; }
++        encStop();
++        wpRender();
++
++        var out = msg + "<br>";
++        for (var i = 0; i < wpLog.length; i++) {
++            var e = wpLog[i];
++            var err = e.want > 0 ? ((e.got - e.want) / e.want * 100) : 0;
++            out += "step " + e.step + ": wanted " + e.want + ", got " + e.got +
++                   " (" + (err >= 0 ? "+" : "") + err.toFixed(1) + "%)" +
++                   (e.timedOut ? " <b>TIMED OUT</b>" : "") + "<br>";
++        }
++        out += "Now measure with a tape. Travelled further than asked &rarr; increase WHEEL DIA. " +
++               "Over-rotated on a spin &rarr; increase TRACK WIDTH.";
++        document.getElementById("wpStatus").innerHTML = out;
++    }
++
++    cfgDerive();
++    cfgRead();
++    // --- --- --- PID tuner --- --- ---
++    var pidLive = false;
++    var pidPollTimer = null;
++    var pidBuf = [];              // {t, sL, mL, sR, mR}
++    var pidBufMax = 300;
++    var pidTestOn = false;
++    var pidTestT0 = 0;
++    var pidTestTarget = 0;
++    var pidTestData = [];
++
++    function pidApply(save) {
++        var cmd = {
++            "T": 700,
++            "kp": parseFloat(document.getElementById("pidP").value) || 0,
++            "ki": parseFloat(document.getElementById("pidI").value) || 0,
++            "kd": parseFloat(document.getElementById("pidD").value) || 0,
++            "lim": parseFloat(document.getElementById("pidLim").value) || 255,
++            "save": save
++        };
++        var xhr = new XMLHttpRequest();
++        xhr.onreadystatechange = function() {
++            if (this.readyState == 4 && this.status == 200) {
++                document.getElementById("pidMetrics").innerHTML =
++                    save ? "Gains saved to flash." : "Gains applied (RAM only).";
++            }
++        };
++        xhr.open("GET", "js?json=" + JSON.stringify(cmd), true);
++        xhr.send();
++    }
++
++    function pidReadCfg() {
++        var xhr = new XMLHttpRequest();
++        xhr.onreadystatechange = function() {
++            if (this.readyState == 4 && this.status == 200) {
++                var r; try { r = JSON.parse(this.responseText); } catch(e) { return; }
++                if (r.kp !== undefined) {
++                    document.getElementById("pidP").value = r.kp;
++                    document.getElementById("pidI").value = r.ki;
++                    document.getElementById("pidD").value = r.kd;
++                    document.getElementById("pidLim").value = r.lim;
++                    document.getElementById("pidMetrics").innerHTML = "Gains read from board.";
++                }
++            }
++        };
++        xhr.open("GET", "js?json=" + JSON.stringify({"T":701}), true);
++        xhr.send();
++    }
++
++    function pidPreset(which) {
++        var P = parseFloat(document.getElementById("pidP").value) || 0;
++        var I = parseFloat(document.getElementById("pidI").value) || 0;
++        if (which == "safe")     { document.getElementById("pidP").value = 200; document.getElementById("pidI").value = 200; document.getElementById("pidD").value = 0; document.getElementById("pidLim").value = 255; }
++        if (which == "ponly")    { document.getElementById("pidI").value = 0; document.getElementById("pidD").value = 0; }
++        if (which == "halveI")   { document.getElementById("pidI").value = Math.round(I / 2); }
++        if (which == "doubleI")  { document.getElementById("pidI").value = Math.round(I * 2); }
++        pidApply(0);
++    }
++
++    function pidLiveToggle() {
++        pidLive = !pidLive;
++        document.getElementById("pidLiveBtn").innerHTML = "LIVE: " + (pidLive ? "ON" : "OFF");
++        if (pidLive && !pidPollTimer) {
++            pidPollTimer = setInterval(pidPoll, 100);
++        } else if (!pidLive && pidPollTimer && !pidTestOn) {
++            clearInterval(pidPollTimer); pidPollTimer = null;
++        }
++    }
++
++    function pidPoll() {
++        var xhttp = new XMLHttpRequest();
++        xhttp.onreadystatechange = function() {
++            if (this.readyState == 4 && this.status == 200) {
++                var r; try { r = JSON.parse(this.responseText); } catch(e) { return; }
++                if (r.L === undefined) { return; }
++                var now = Date.now();
++                var pt = {t: now, sL: r.sL || 0, mL: r.L || 0, sR: r.sR || 0, mR: r.R || 0};
++                pidBuf.push(pt);
++                if (pidBuf.length > pidBufMax) { pidBuf.shift(); }
++                if (pidTestOn) { pidTestData.push({t: (now - pidTestT0) / 1000, mL: pt.mL, mR: pt.mR}); }
++                pidDraw();
++            }
++        };
++        xhttp.open("GET", "js?json=" + JSON.stringify({"T":130}), true);
++        xhttp.send();
++    }
++
++    function pidDraw() {
++        var c = document.getElementById("pidPlot");
++        if (!c) { return; }
++        var g = c.getContext("2d");
++        var W = c.width, H = c.height;
++        g.clearRect(0, 0, W, H);
++
++        // scale
++        var mx = 0.05;
++        for (var i = 0; i < pidBuf.length; i++) {
++            var p = pidBuf[i];
++            mx = Math.max(mx, Math.abs(p.sL), Math.abs(p.mL), Math.abs(p.sR), Math.abs(p.mR));
++        }
++        mx = mx * 1.25;
++
++        function Y(v) { return H / 2 - (v / mx) * (H / 2 - 10); }
++        function X(i) { return (i / Math.max(1, pidBufMax - 1)) * W; }
++
++        // grid
++        g.strokeStyle = "#2a2f3d"; g.lineWidth = 1;
++        g.beginPath(); g.moveTo(0, H / 2); g.lineTo(W, H / 2); g.stroke();
++        g.fillStyle = "#667"; g.font = "10px sans-serif";
++        g.fillText(mx.toFixed(2) + " m/s", 4, 12);
++        g.fillText("-" + mx.toFixed(2), 4, H - 4);
++
++        function line(key, col) {
++            g.strokeStyle = col; g.lineWidth = 1.5; g.beginPath();
++            for (var i = 0; i < pidBuf.length; i++) {
++                var x = X(i), y = Y(pidBuf[i][key]);
++                if (i === 0) { g.moveTo(x, y); } else { g.lineTo(x, y); }
++            }
++            g.stroke();
++        }
++        line("sL", "#6cf");
++        line("mL", "#ffffff");
++        line("sR", "#f96");
++        line("mR", "#9c8");
++    }
++
++    // one step test, then hand the metrics to done(L, R)
++    function pidRunStep(target, hold, done) {
++        pidBuf = [];
++        pidTestData = [];
++        pidTestTarget = target;
++        if (!pidPollTimer) { pidPollTimer = setInterval(pidPoll, 100); }
++        encDrive(0, 0);
++        setTimeout(function() {
++            pidTestT0 = Date.now();
++            pidTestOn = true;
++            encDrive(target, target);
++            setTimeout(function() {
++                pidTestOn = false;
++                encStop();
++                setTimeout(function() {
++                    done(pidAnalyse("mL"), pidAnalyse("mR"));
++                }, 300);
++            }, hold * 1000);
++        }, 700);
++    }
++
++    function pidStep() {
++        var target = parseFloat(document.getElementById("pidTarget").value) || 0.2;
++        var hold = parseFloat(document.getElementById("pidHold").value) || 2;
++
++        pidApply(0);                       // make sure the gains on screen are live
++        pidBuf = [];
++        pidTestData = [];
++        pidTestTarget = target;
++
++        if (!pidPollTimer) { pidPollTimer = setInterval(pidPoll, 100); }
++
++        document.getElementById("pidMetrics").innerHTML = "Settling at zero...";
++        encDrive(0, 0);
++
++        setTimeout(function() {
++            pidTestT0 = Date.now();
++            pidTestOn = true;
++            encDrive(target, target);
++            document.getElementById("pidMetrics").innerHTML = "Step running...";
++
++            setTimeout(function() {
++                pidTestOn = false;
++                encStop();
++                setTimeout(pidReport, 300);
++            }, hold * 1000);
++        }, 700);
++    }
++
++    function pidStop() {
++        pidTestOn = false;
++        encStop();
++        if (pidPollTimer && !pidLive) { clearInterval(pidPollTimer); pidPollTimer = null; }
++    }
++
++    function pidAnalyse(key) {
++        var t = pidTestTarget;
++        if (pidTestData.length < 4 || t == 0) { return null; }
++
++        var peak = 0, rise = null, i;
++        for (i = 0; i < pidTestData.length; i++) {
++            var v = pidTestData[i][key];
++            if (Math.abs(v) > Math.abs(peak)) { peak = v; }
++            if (rise === null && Math.abs(v) >= Math.abs(t) * 0.9) { rise = pidTestData[i].t; }
++        }
++        // steady state = mean of the last third
++        var start = Math.floor(pidTestData.length * 0.66), sum = 0, n = 0;
++        for (i = start; i < pidTestData.length; i++) { sum += pidTestData[i][key]; n++; }
++        var ss = n ? sum / n : 0;
++
++        // ringing: sign changes about the settled value, second half only
++        var osc = 0, prev = null, half = Math.floor(pidTestData.length * 0.4);
++        for (i = half; i < pidTestData.length; i++) {
++            var dv = pidTestData[i][key] - ss;
++            if (Math.abs(dv) < Math.abs(t) * 0.05) { continue; }
++            var sgn = dv > 0 ? 1 : -1;
++            if (prev !== null && sgn !== prev) { osc++; }
++            prev = sgn;
++        }
++
++        return {
++            peak: peak,
++            overshoot: (Math.abs(peak) - Math.abs(t)) / Math.abs(t) * 100,
++            rise: rise,
++            ss: ss,
++            ssErr: (ss - t) / t * 100,
++            osc: osc
++        };
++    }
++
++    function pidReport() {
++        var L = pidAnalyse("mL");
++        var R = pidAnalyse("mR");
++        if (!L || !R) {
++            document.getElementById("pidMetrics").innerHTML = "Not enough samples &mdash; try a longer hold.";
++            return;
++        }
++
++        function row(name, a) {
++            return "<b>" + name + "</b>  rise(90%): " + (a.rise === null ? "never" : a.rise.toFixed(2) + "s") +
++                   " &nbsp; overshoot: " + a.overshoot.toFixed(0) + "%" +
++                   " &nbsp; steady: " + a.ss.toFixed(3) + " m/s (" + (a.ssErr >= 0 ? "+" : "") + a.ssErr.toFixed(0) + "%)<br>";
++        }
++
++        var advice = "";
++        var worstOver = Math.max(L.overshoot, R.overshoot);
++        var worstErr = Math.max(Math.abs(L.ssErr), Math.abs(R.ssErr));
++        var noRise = (L.rise === null || R.rise === null);
++
++        if (Math.abs(L.ss) < 0.01 && Math.abs(R.ss) < 0.01) {
++            advice = "No movement measured. Either the wheels are not being driven, or the encoders are not counting &mdash; check the encoder test before tuning.";
++        } else if ((L.ss > 0) != (pidTestTarget > 0) || (R.ss > 0) != (pidTestTarget > 0)) {
++            advice = "<b>Measured speed has the opposite sign to the command.</b> That is a runaway waiting to happen &mdash; tick FLIP ENCODER for that wheel in the configurator, then retest.";
++        } else if (worstOver > 60) {
++            advice = "Large overshoot &mdash; halve I, and if it still rings, reduce P by a third.";
++        } else if (noRise) {
++            advice = "Never reached 90% of target &mdash; raise P, or raise I if it is creeping up slowly.";
++        } else if (worstErr > 15) {
++            advice = "Settles well short of target &mdash; raise I (try doubling it).";
++        } else if (worstOver > 25) {
++            advice = "Slight overshoot. Acceptable, but halving I will smooth it.";
++        } else {
++            advice = "<b>Good response.</b> Rise under ~0.5s, overshoot under 25%, steady-state within 15%. Press SAVE to write these gains to flash.";
++        }
++
++        var mismatch = Math.abs(Math.abs(L.ss) - Math.abs(R.ss));
++        if (mismatch > Math.abs(pidTestTarget) * 0.2) {
++            advice += "<br>Left and right settle at noticeably different speeds &mdash; check for a binding wheel or a weak motor.";
++        }
++
++        document.getElementById("pidMetrics").innerHTML =
++            "target " + pidTestTarget.toFixed(2) + " m/s<br>" + row("LEFT ", L) + row("RIGHT", R) + "<br>" + advice;
++    }
++
++
++    // --- --- --- auto tuner --- --- ---
++    var autoOn = false;
++    var autoStage = "";
++    var autoP = 0, autoI = 0;
++    var autoBestP = 0;
++    var autoIter = 0;
++    var autoLog = [];
++
++    var AUTO_MAX_ITER   = 18;
++    var AUTO_P_START    = 60;
++    var AUTO_P_MAX      = 3000;
++    var AUTO_I_MAX      = 20000;
++    var OK_OVERSHOOT    = 25;    // %
++    var OK_SS_ERR       = 10;    // %
++    var OK_RISE         = 0.6;   // s
++
++    function autoSay(html) { document.getElementById("pidMetrics").innerHTML = html; }
++
++    function autoTable() {
++        var t = "<table style='font-size:11px;width:100%'><tr style='opacity:.6'>" +
++                "<td>#</td><td>P</td><td>I</td><td>rise</td><td>over%</td><td>ss err%</td><td>osc</td></tr>";
++        for (var i = 0; i < autoLog.length; i++) {
++            var e = autoLog[i];
++            t += "<tr><td>" + (i + 1) + "</td><td>" + e.P + "</td><td>" + e.I + "</td><td>" +
++                 (e.rise === null ? "-" : e.rise.toFixed(2)) + "</td><td>" + e.over.toFixed(0) +
++                 "</td><td>" + e.err.toFixed(0) + "</td><td>" + e.osc + "</td></tr>";
++        }
++        return t + "</table>";
++    }
++
++    // push gains to the board, then run one step test
++    function autoTrial(P, I, done) {
++        if (!autoOn) { return; }
++        document.getElementById("pidP").value = Math.round(P);
++        document.getElementById("pidI").value = Math.round(I);
++        document.getElementById("pidD").value = 0;
++
++        var cmd = {"T":700, "kp": Math.round(P), "ki": Math.round(I), "kd": 0,
++                   "lim": parseFloat(document.getElementById("pidLim").value) || 255, "save": 0};
++        var xhr = new XMLHttpRequest();
++        xhr.onreadystatechange = function() {
++            if (this.readyState == 4) {
++                setTimeout(function() {
++                    if (!autoOn) { return; }
++                    var target = parseFloat(document.getElementById("pidTarget").value) || 0.2;
++                    var hold = parseFloat(document.getElementById("pidHold").value) || 2;
++                    pidRunStep(target, hold, function(L, R) {
++                        if (!autoOn) { return; }
++                        if (!L || !R) { autoFail("No data from the step test."); return; }
++
++                        // judge on the worse wheel
++                        var e = {
++                            P: Math.round(P), I: Math.round(I),
++                            rise: (L.rise === null || R.rise === null) ? null : Math.max(L.rise, R.rise),
++                            over: Math.max(L.overshoot, R.overshoot),
++                            err:  Math.max(Math.abs(L.ssErr), Math.abs(R.ssErr)),
++                            osc:  Math.max(L.osc, R.osc),
++                            ssL: L.ss, ssR: R.ss
++                        };
++                        autoLog.push(e);
++                        autoIter++;
++                        done(e, L, R);
++                    });
++                }, 250);
++            }
++        };
++        xhr.open("GET", "js?json=" + JSON.stringify(cmd), true);
++        xhr.send();
++    }
++
++    function autoFail(msg) {
++        autoOn = false;
++        encStop();
++        autoSay("<b>Auto-tune stopped.</b><br>" + msg + "<br>" + autoTable());
++    }
++
++    function autoStart() {
++        if (autoOn) { return; }
++        autoOn = true;
++        autoLog = [];
++        autoIter = 0;
++        autoP = AUTO_P_START;
++        autoI = 0;
++        autoStage = "check";
++        autoSay("Auto-tune: safety check...");
++        autoTrial(120, 0, autoCheck);
++    }
++
++    function autoAbort() {
++        autoOn = false;
++        encStop();
++        autoSay("Aborted by user.<br>" + autoTable());
++    }
++
++    // stage 1 - is the feedback usable at all?
++    function autoCheck(e, L, R) {
++        var target = parseFloat(document.getElementById("pidTarget").value) || 0.2;
++
++        if (Math.abs(L.ss) < 0.01 && Math.abs(R.ss) < 0.01) {
++            autoFail("No movement measured. Either the wheels are not driving or the encoders are not counting. " +
++                     "Fix that in the encoder test before tuning.");
++            return;
++        }
++        if ((L.ss > 0) != (target > 0) || (R.ss > 0) != (target > 0)) {
++            autoFail("<b>Feedback sign is inverted</b> &mdash; measured speed opposes the command. " +
++                     "Tick FLIP ENCODER for that wheel in the configurator, then run auto-tune again.");
++            return;
++        }
++        autoStage = "findP";
++        autoP = AUTO_P_START;
++        autoSay("Stage 1/3: raising P until it rings...<br>" + autoTable());
++        autoTrial(autoP, 0, autoFindP);
++    }
++
++    // stage 2 - climb P until the response overshoots or oscillates
++    function autoFindP(e) {
++        if (!autoOn) { return; }
++        if (autoIter > AUTO_MAX_ITER) { autoFail("Gave up: too many iterations."); return; }
++
++        var ringing = (e.over > 30) || (e.osc >= 3);
++
++        if (ringing || autoP >= AUTO_P_MAX) {
++            autoBestP = Math.max(AUTO_P_START, autoP * 0.6);   // back off from the ringing point
++            autoStage = "findI";
++            autoI = autoBestP * 0.5;
++            autoSay("Stage 2/3: P settled at " + Math.round(autoBestP) + ", now raising I...<br>" + autoTable());
++            autoTrial(autoBestP, autoI, autoFindI);
++            return;
++        }
++
++        autoP = autoP * 1.7;
++        autoSay("Stage 1/3: P = " + Math.round(autoP) + "...<br>" + autoTable());
++        autoTrial(autoP, 0, autoFindP);
++    }
++
++    // stage 3 - climb I until steady-state error is gone, then back off
++    function autoFindI(e) {
++        if (!autoOn) { return; }
++        if (autoIter > AUTO_MAX_ITER) { autoFail("Gave up: too many iterations."); return; }
++
++        var tooMuch = (e.over > 45) || (e.osc >= 4);
++        var goodEnough = (e.err <= OK_SS_ERR) && (e.over <= OK_OVERSHOOT);
++
++        if (tooMuch) {
++            autoI = autoI * 0.5;
++            autoStage = "verify";
++            autoSay("Stage 3/3: backing I off to " + Math.round(autoI) + " and verifying...<br>" + autoTable());
++            autoTrial(autoBestP, autoI, autoVerify);
++            return;
++        }
++        if (goodEnough || autoI >= AUTO_I_MAX) {
++            autoStage = "verify";
++            autoSay("Stage 3/3: verifying P=" + Math.round(autoBestP) + " I=" + Math.round(autoI) + "...<br>" + autoTable());
++            autoTrial(autoBestP, autoI, autoVerify);
++            return;
++        }
++
++        autoI = (autoI < 1) ? 50 : autoI * 2;
++        autoSay("Stage 2/3: I = " + Math.round(autoI) + "...<br>" + autoTable());
++        autoTrial(autoBestP, autoI, autoFindI);
++    }
++
++    function autoVerify(e) {
++        autoOn = false;
++        encStop();
++
++        var pass = (e.over <= OK_OVERSHOOT) && (e.err <= OK_SS_ERR) &&
++                   (e.rise !== null && e.rise <= OK_RISE);
++
++        var msg = "<b>Auto-tune finished.</b><br>" +
++                  "P = <b>" + Math.round(autoBestP) + "</b>, I = <b>" + Math.round(autoI) + "</b>, D = 0<br>" +
++                  "rise " + (e.rise === null ? "n/a" : e.rise.toFixed(2) + "s") +
++                  ", overshoot " + e.over.toFixed(0) + "%, steady-state error " + e.err.toFixed(0) + "%<br>";
++
++        msg += pass
++            ? "Meets the targets (rise &lt;" + OK_RISE + "s, overshoot &lt;" + OK_OVERSHOOT +
++              "%, error &lt;" + OK_SS_ERR + "%). Press SAVE to keep these gains.<br>"
++            : "Close but outside targets &mdash; usable, but a manual nudge may improve it. " +
++              "Press SAVE to keep, or adjust by hand and STEP TEST.<br>";
++
++        msg += "<br>" + autoTable();
++        autoSay(msg);
++    }
++
++    pidReadCfg();
+ </script>
+ </body>
+ </html>
+diff --git a/General_Driver/wifi_ctrl.h b/General_Driver/wifi_ctrl.h
+index 9901101..ccbb3df 100644
+--- a/General_Driver/wifi_ctrl.h
++++ b/General_Driver/wifi_ctrl.h
+@@ -46,24 +46,18 @@ bool wifiConfigFound = false;
+ // update oled accroding to wifi settings.
+ void updateOledWifiInfo() {
+   switch(WIFI_CURRENT_MODE) {
+-  case 0: 
+-    screenLine_0 = "AP: OFF";
+-    screenLine_1 = "ST: OFF";
++  case 0:
++    oledIpStr = "off";
+     break;
+   case 1:
+-    screenLine_0 = String("AP:") + ap_ssid;
+-    screenLine_1 = "ST: OFF";
++    oledIpStr = "192.168.4.1";
+     break;
+   case 2:
+-    screenLine_0 = "AP: OFF";
+-    screenLine_1 = String("ST:") + localIP.toString();
+-    break;
+   case 3:
+-    screenLine_0 = String("AP:") + ap_ssid;
+-    screenLine_1 = String("ST:") + localIP.toString();
++    oledIpStr = localIP.toString();
+     break;
+   }
+-  oled_update();
++  oledDefaultInfo();
+ }
+ 
+ 

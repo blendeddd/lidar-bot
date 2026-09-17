@@ -1,0 +1,722 @@
+#!/usr/bin/env python3
+"""
+lidar-bot all-in-one: telemetry + lidar + gamepad + web dashboard.
+
+Runs ONE process that owns both serial ports (the ESP32 can only be opened by
+one program at a time), so don't run gamepad_car.py alongside this.
+
+  sudo apt install -y python3-serial python3-evdev
+  python3 robot_server.py
+  then open  http://<pi-ip>:8080
+
+  --no-pad      telemetry + lidar only
+  --lidar PORT  force the lidar port (default: first /dev/ttyUSB*)
+"""
+import sys, os, glob, json, math, time, struct, threading, socketserver
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import serial
+
+ESP_PORT, ESP_BAUD = "/dev/ttyAMA0", 115200
+LIDAR_BAUD = 230400
+HTTP_PORT = 8080
+SETTINGS = os.path.expanduser("~/.lidarbot_drive.json")
+
+CFG = {"max_lin": 0.45, "turn_gain": 0.60, "pivot": 0.30,
+       "normal": 0.60, "steer_inv": True}
+try:
+    CFG.update(json.load(open(os.path.expanduser("~/.lidarbot_drive.json"))))
+except Exception:
+    pass
+
+def save_cfg():
+    try:
+        json.dump(CFG, open(os.path.expanduser("~/.lidarbot_drive.json"), "w"), indent=2)
+    except Exception:
+        pass
+
+CAM = {"on": True, "index": 0, "width": 640, "height": 480,
+       "fps": 15, "quality": 60, "flip": False}
+
+cam_state = {"frame": None, "kbps": 0.0, "fps": 0.0, "err": "", "size": "-"}
+
+def camera_thread():
+    try:
+        import cv2
+    except ImportError:
+        cam_state["err"] = "python3-opencv not installed"
+        return
+
+    cap = None
+    cur = None
+    bytes_win, frames_win, t_win = 0, 0, time.time()
+
+    while True:
+        if not CAM["on"]:
+            if cap is not None:
+                cap.release(); cap = None; cur = None
+            cam_state["frame"] = None
+            time.sleep(0.3)
+            continue
+
+        want = (CAM["index"], CAM["width"], CAM["height"], CAM["fps"])
+        if cap is None or cur != want:
+            if cap is not None:
+                cap.release()
+            cap = cv2.VideoCapture(CAM["index"])
+            # ask the camera for MJPEG - far less USB bandwidth than raw YUV
+            cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAM["width"])
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAM["height"])
+            cap.set(cv2.CAP_PROP_FPS, CAM["fps"])
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            cur = want
+            if not cap.isOpened():
+                cam_state["err"] = f"cannot open camera {CAM['index']}"
+                cap.release(); cap = None
+                time.sleep(2)
+                continue
+            cam_state["err"] = ""
+
+        ok, frame = cap.read()
+        if not ok:
+            cam_state["err"] = "read failed"
+            cap.release(); cap = None
+            time.sleep(0.5)
+            continue
+
+        if CAM["flip"]:
+            frame = cv2.flip(frame, -1)
+
+        ok, buf = cv2.imencode(".jpg", frame,
+                               [int(cv2.IMWRITE_JPEG_QUALITY), int(CAM["quality"])])
+        if ok:
+            data = buf.tobytes()
+            cam_state["frame"] = data
+            cam_state["size"] = f"{frame.shape[1]}x{frame.shape[0]}"
+            bytes_win += len(data); frames_win += 1
+
+        now = time.time()
+        if now - t_win >= 1.0:
+            cam_state["kbps"] = bytes_win / 1024.0 / (now - t_win)
+            cam_state["fps"] = frames_win / (now - t_win)
+            bytes_win, frames_win, t_win = 0, 0, now
+
+        time.sleep(max(0.0, 1.0 / max(1, CAM["fps"]) - 0.005))
+
+
+state = {
+    "cfg": CFG,
+    "mode": 0,                  # 1 = open loop, 3 = closed loop (from the board)
+    "telem": {},
+    "scan": [],                 # [[angle_deg, dist_mm], ...]
+    "lidar_rpm": 0.0,
+    "drive": {"armed": False, "throttle": 0.0, "steer": 0.0, "l": 0.0, "r": 0.0},
+    "pad": "none",
+    "cam": CAM,
+    "cam_stat": cam_state,
+}
+lock = threading.Lock()
+ESP = None
+
+
+# --------------------------------------------------------------- ESP32 link
+class Esp:
+    def __init__(self):
+        self.ser = serial.Serial(ESP_PORT, ESP_BAUD, timeout=0.3)
+        self.wlock = threading.Lock()
+        threading.Thread(target=self._read, daemon=True).start()
+
+    def _read(self):
+        while True:
+            try:
+                line = self.ser.readline().decode(errors="ignore").strip()
+                if not line:
+                    continue
+                d = json.loads(line)
+                if "odl" in d or "v" in d:
+                    with lock:
+                        state["telem"].update(d)
+                        if "mt" in d:
+                            state["mode"] = d["mt"]
+            except Exception:
+                continue
+
+    def send(self, obj):
+        try:
+            with self.wlock:
+                self.ser.write((json.dumps(obj) + "\n").encode())
+                self.ser.flush()
+        except Exception:
+            pass
+
+
+# --------------------------------------------------------------- lidar
+def lidar_thread(port):
+    while True:
+        try:
+            ser = serial.Serial(port, LIDAR_BAUD, timeout=1)
+            buf = bytearray()
+            pts = {}
+            while True:
+                buf += ser.read(max(1, ser.in_waiting))
+                while True:
+                    i = buf.find(b'\x54')
+                    if i < 0 or len(buf) < i + 2:
+                        break
+                    n = buf[i + 1] & 0x1F
+                    plen = 11 + 3 * n
+                    if len(buf) < i + plen:
+                        break
+                    pkt = bytes(buf[i:i + plen])
+                    del buf[:i + plen]
+
+                    speed = struct.unpack_from('<H', pkt, 2)[0]
+                    a0 = struct.unpack_from('<H', pkt, 4)[0] / 100.0
+                    a1 = struct.unpack_from('<H', pkt, 6 + 3 * n)[0] / 100.0
+                    span = (a1 - a0) % 360.0
+                    step = span / (n - 1) if n > 1 else 0
+                    for k in range(n):
+                        dist, _q = struct.unpack_from('<HB', pkt, 6 + 3 * k)
+                        ang = (a0 + step * k) % 360.0
+                        if 0 < dist < 20000:
+                            pts[int(ang)] = dist
+                    if a1 < a0:          # completed a revolution
+                        with lock:
+                            state["scan"] = sorted(pts.items())
+                            state["lidar_rpm"] = speed / 6.0
+                        pts = {}
+        except Exception:
+            with lock:
+                state["scan"] = []
+            time.sleep(2)
+
+
+# --------------------------------------------------------------- gamepad
+def pad_thread(esp):
+    from evdev import InputDevice, ecodes, list_devices
+
+    cfg = CFG
+
+    dev = None
+    for p in list_devices():
+        d = InputDevice(p)
+        c = d.capabilities()
+        if ecodes.EV_ABS in c and ecodes.EV_KEY in c and \
+           ecodes.ABS_X in [x for x, _ in c[ecodes.EV_ABS]]:
+            dev = d
+            break
+    if dev is None:
+        with lock:
+            state["pad"] = "not found"
+        return
+
+    info = {c: i for c, i in dev.capabilities()[ecodes.EV_ABS]}
+    have = list(info)
+    ax_rt = ecodes.ABS_GAS if ecodes.ABS_GAS in have else ecodes.ABS_RZ
+    ax_lt = ecodes.ABS_BRAKE if ecodes.ABS_BRAKE in have else ecodes.ABS_Z
+    with lock:
+        state["pad"] = dev.name
+
+    vals = {ecodes.ABS_X: 0, ax_rt: 0, ax_lt: 0}
+    held, armed = set(), False
+
+    def stick(raw):
+        i = info[ecodes.ABS_X]
+        mid, half = (i.max + i.min) / 2.0, ((i.max - i.min) / 2.0 or 1)
+        v = (raw - mid) / half
+        if abs(v) < 0.12:
+            return 0.0
+        v = (abs(v) - 0.12) / 0.88 * (1 if v > 0 else -1)
+        return -v if cfg["steer_inv"] else v
+
+    def trig(code, raw):
+        i = info[code]
+        v = (raw - i.min) / ((i.max - i.min) or 1)
+        return 0.0 if v < 0.06 else (v - 0.06) / 0.94
+
+    dev.grab()
+    last = 0.0
+    while True:
+        try:
+            for ev in dev.read():
+                if ev.type == ecodes.EV_ABS and ev.code in vals:
+                    vals[ev.code] = ev.value
+                elif ev.type == ecodes.EV_KEY:
+                    if ev.value == 1:
+                        held.add(ev.code)
+                        if ev.code == ecodes.BTN_SOUTH:
+                            armed = not armed
+                        elif ev.code == ecodes.BTN_EAST:
+                            armed = False
+                        elif ev.code == ecodes.BTN_WEST:
+                            cfg["steer_inv"] = not cfg["steer_inv"]
+                            save_cfg()
+                    else:
+                        held.discard(ev.code)
+        except BlockingIOError:
+            pass
+        except OSError:
+            with lock:
+                state["pad"] = "disconnected"
+            return
+
+        now = time.time()
+        if now - last < 0.04:
+            time.sleep(0.002)
+            continue
+        last = now
+
+        scale = 1.0 if ecodes.BTN_TL in held else cfg["normal"]
+        throttle = trig(ax_rt, vals[ax_rt]) - trig(ax_lt, vals[ax_lt])
+        steer = stick(vals[ecodes.ABS_X])
+
+        if not armed:
+            l = r = v = 0.0
+        else:
+            v = throttle * cfg["max_lin"] * scale
+            if abs(v) < 0.06:
+                t = steer * cfg["pivot"] * scale
+                l, r = t, -t
+            else:
+                k = abs(steer) * cfg["turn_gain"]
+                l, r = (v, v * (1 - 2 * k)) if steer > 0 else (v * (1 - 2 * k), v)
+
+        esp.send({"T": 1, "L": round(l, 3), "R": round(r, 3)})
+        with lock:
+            state["drive"] = {"armed": armed, "throttle": throttle,
+                              "steer": steer, "l": l, "r": r}
+
+
+# --------------------------------------------------------------- web
+PAGE = """<!DOCTYPE html><html><head><meta charset="utf-8">
+<title>lidar-bot</title><meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+*{box-sizing:border-box}
+body{margin:0;background:#12141c;color:#c9d1e0;font-family:system-ui,sans-serif}
+.wrap{display:flex;flex-wrap:wrap;gap:14px;padding:14px;max-width:1100px;margin:0 auto}
+.card{background:#1b1f2b;border-radius:12px;padding:14px;flex:1 1 260px}
+.big{font-size:30px;color:#fff;line-height:1.1}
+.lab{font-size:11px;opacity:.6;letter-spacing:.05em}
+.row{display:flex;gap:18px;flex-wrap:wrap}
+canvas{width:100%;background:#0c0e14;border-radius:10px;display:block}
+.pill{display:inline-block;padding:3px 10px;border-radius:20px;font-size:12px;font-weight:600}
+.on{background:#2a7;color:#041} .off{background:#444;color:#bbb} .warn{background:#a33;color:#fff}
+.bar{height:10px;background:#0c0e14;border-radius:5px;overflow:hidden;margin-top:6px}
+.fill{height:100%;background:#4a8;width:0}
+h2{font-size:13px;margin:0 0 10px;opacity:.75;font-weight:600;letter-spacing:.06em}
+</style></head><body>
+<div class="wrap">
+  <div class="card" style="flex:1 1 420px">
+    <h2>LIDAR</h2>
+    <canvas id="lidar" width="520" height="520"></canvas>
+    <div class="lab" style="margin-top:8px"><span id="lrpm">--</span> rpm &middot; <span id="lpts">0</span> points &middot; range <span id="lrange">6</span> m
+      <button onclick="zoom(0.5)">+</button><button onclick="zoom(2)">-</button></div>
+  </div>
+
+  <div class="card" style="flex:1 1 420px">
+    <h2>CAMERA</h2>
+    <img id="cam" src="/stream.mjpg" style="width:100%;border-radius:10px;background:#0c0e14;display:block">
+    <div class="lab" style="margin-top:6px">
+      <span id="camStat">--</span>
+      <span id="camErr" style="color:#f88"></span>
+    </div>
+
+    <div class="row" style="margin-top:10px;align-items:center;gap:10px">
+      <label class="lab">RES
+        <select id="camRes" onchange="camRes()" style="margin-left:4px">
+          <option value="320x240">320x240</option>
+          <option value="640x480" selected>640x480</option>
+          <option value="800x600">800x600</option>
+          <option value="1280x720">1280x720</option>
+          <option value="1920x1080">1920x1080</option>
+        </select>
+      </label>
+      <label class="lab">CAM #
+        <input type="number" id="camIdx" value="0" min="0" max="8" style="width:52px;margin-left:4px"
+               onchange="setCam('index', this.value)">
+      </label>
+      <button class="pill off" style="border:0;cursor:pointer" onclick="camToggle()" id="camOn">ON</button>
+      <button class="pill off" style="border:0;cursor:pointer" onclick="camFlip()">FLIP</button>
+    </div>
+
+    <label class="lab">FPS <b id="vFps">15</b></label>
+    <input type="range" id="sFps" min="1" max="30" step="1" style="width:100%"
+           oninput="setCam('fps', this.value)">
+
+    <label class="lab">JPEG QUALITY <b id="vQual">60</b> &mdash; higher = sharper &amp; more bandwidth</label>
+    <input type="range" id="sQual" min="10" max="95" step="5" style="width:100%"
+           oninput="setCam('quality', this.value)">
+
+    <div class="row" style="margin-top:8px">
+      <button onclick="camPreset(320,240,10,40)" class="pill off" style="border:0;cursor:pointer">LOW BW</button>
+      <button onclick="camPreset(640,480,15,60)" class="pill off" style="border:0;cursor:pointer">BALANCED</button>
+      <button onclick="camPreset(1280,720,20,80)" class="pill warn" style="border:0;cursor:pointer">HIGH</button>
+    </div>
+  </div>
+
+  <div style="flex:1 1 300px;display:flex;flex-direction:column;gap:14px">
+    <div class="card">
+      <h2>POWER</h2>
+      <div class="row">
+        <div><div class="big" id="pv">--</div><div class="lab">PACK VOLTS</div></div>
+        <div><div class="big" id="pct">--</div><div class="lab">CHARGE</div></div>
+      </div>
+      <div class="row" style="margin-top:12px">
+        <div><div class="big" id="amp">--</div><div class="lab">AMPS</div></div>
+        <div><div class="big" id="rail">--</div><div class="lab">12V RAIL</div></div>
+      </div>
+      <div class="bar"><div class="fill" id="batbar"></div></div>
+    </div>
+
+    <div class="card">
+      <h2>DRIVE</h2>
+      <div class="row" style="align-items:center">
+        <span class="pill off" id="arm">DISARMED</span>
+        <span class="pill off" id="dir">IDLE</span>
+      </div>
+      <canvas id="wheel" width="300" height="150" style="margin-top:10px"></canvas>
+      <div class="row" style="margin-top:8px">
+        <div><div class="big" id="steer">0&deg;</div><div class="lab">STEERING</div></div>
+        <div><div class="big" id="spd">0.00</div><div class="lab">m/s CMD</div></div>
+      </div>
+      <div class="lab" style="margin-top:8px">L <span id="wl">0.00</span> &nbsp; R <span id="wr">0.00</span>
+        &nbsp;&middot;&nbsp; pad: <span id="pad">--</span></div>
+    </div>
+
+    <div class="card">
+      <h2>TUNING</h2>
+      <div class="row" style="margin-bottom:10px">
+        <button id="mOpen"  onclick="setMode(1)" class="pill off" style="border:0;cursor:pointer">OPEN LOOP</button>
+        <button id="mClosed" onclick="setMode(3)" class="pill off" style="border:0;cursor:pointer">CLOSED LOOP (PID)</button>
+      </div>
+      <div class="lab" id="modeHint" style="margin-bottom:12px">&nbsp;</div>
+
+      <label class="lab">MAX SPEED <b id="vMax">0.45</b></label>
+      <input type="range" id="sMax" min="0.05" max="1.5" step="0.05" style="width:100%"
+             oninput="setCfg('max_lin', this.value)">
+
+      <label class="lab">TURN SHARPNESS <b id="vTurn">0.60</b></label>
+      <input type="range" id="sTurn" min="0.05" max="2" step="0.05" style="width:100%"
+             oninput="setCfg('turn_gain', this.value)">
+
+      <label class="lab">PIVOT SPEED (on the spot) <b id="vPiv">0.30</b></label>
+      <input type="range" id="sPiv" min="0.05" max="1.5" step="0.05" style="width:100%"
+             oninput="setCfg('pivot', this.value)">
+
+      <label class="lab">NORMAL SCALE (no boost) <b id="vNorm">0.60</b></label>
+      <input type="range" id="sNorm" min="0.1" max="1" step="0.05" style="width:100%"
+             oninput="setCfg('normal', this.value)">
+
+      <div class="row" style="margin-top:10px">
+        <button onclick="preset(0.35,0.5,0.25)" class="pill off" style="border:0;cursor:pointer">CALM</button>
+        <button onclick="preset(0.5,0.7,0.4)"  class="pill off" style="border:0;cursor:pointer">NORMAL</button>
+        <button onclick="preset(1.0,1.2,0.8)"  class="pill warn" style="border:0;cursor:pointer">AGGRESSIVE</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>IMU</h2>
+      <div class="row">
+        <div><div class="big" id="yaw">--</div><div class="lab">YAW</div></div>
+        <div><div class="big" id="temp">--</div><div class="lab">ESP &deg;C</div></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+var RANGE = 6000;                       // mm shown across the radius
+function zoom(f){ RANGE = Math.max(1000, Math.min(20000, RANGE*f));
+  document.getElementById('lrange').textContent = (RANGE/1000).toFixed(0); }
+
+function drawLidar(scan){
+  var c = document.getElementById('lidar'), g = c.getContext('2d');
+  var W = c.width, H = c.height, cx = W/2, cy = H/2, R = Math.min(cx,cy) - 8;
+  g.clearRect(0,0,W,H);
+
+  g.strokeStyle = '#1e2432'; g.lineWidth = 1;
+  for (var m = 1; m <= 4; m++){
+    g.beginPath(); g.arc(cx, cy, R*m/4, 0, 6.284); g.stroke();
+  }
+  g.beginPath(); g.moveTo(cx,cy-R); g.lineTo(cx,cy+R);
+  g.moveTo(cx-R,cy); g.lineTo(cx+R,cy); g.stroke();
+
+  g.fillStyle = '#556'; g.font = '10px sans-serif';
+  for (var m2 = 1; m2 <= 4; m2++) g.fillText((RANGE*m2/4000).toFixed(1)+'m', cx+4, cy - R*m2/4 + 12);
+
+  g.fillStyle = '#5cf';
+  for (var i=0;i<scan.length;i++){
+    var a = scan[i][0], d = scan[i][1];
+    if (d > RANGE) continue;
+    var rad = (a - 90) * Math.PI / 180;      // 0 deg = forward = up
+    var x = cx + Math.cos(rad) * (d/RANGE) * R;
+    var y = cy + Math.sin(rad) * (d/RANGE) * R;
+    g.fillRect(x-1.5, y-1.5, 3, 3);
+  }
+  // robot
+  g.fillStyle = '#fc6';
+  g.beginPath(); g.moveTo(cx, cy-9); g.lineTo(cx-6, cy+7); g.lineTo(cx+6, cy+7);
+  g.closePath(); g.fill();
+}
+
+function drawWheels(l, r, max){
+  var c = document.getElementById('wheel'), g = c.getContext('2d');
+  g.clearRect(0,0,c.width,c.height);
+  var mid = c.height/2;
+  function bar(x, v, label){
+    var h = Math.max(-1, Math.min(1, v/max)) * (mid-14);
+    g.fillStyle = '#0c0e14'; g.fillRect(x, 10, 54, c.height-20);
+    g.fillStyle = v >= 0 ? '#4a8' : '#a55';
+    g.fillRect(x, mid, 54, -h);
+    g.strokeStyle='#2a3040'; g.beginPath(); g.moveTo(x,mid); g.lineTo(x+54,mid); g.stroke();
+    g.fillStyle='#889'; g.font='11px sans-serif'; g.fillText(label, x+18, c.height-1);
+  }
+  bar(60, l, 'L'); bar(180, r, 'R');
+}
+
+var camTouched = 0;
+function setCam(k, v){
+  camTouched = Date.now();
+  if (k === 'fps')     document.getElementById('vFps').textContent = v;
+  if (k === 'quality') document.getElementById('vQual').textContent = v;
+  fetch('/cam?'+k+'='+v);
+}
+function camRes(){
+  var p = document.getElementById('camRes').value.split('x');
+  camTouched = Date.now();
+  fetch('/cam?width='+p[0]+'&height='+p[1]);
+}
+function camToggle(){
+  var b = document.getElementById('camOn');
+  var on = b.textContent === 'ON' ? 0 : 1;
+  fetch('/cam?on='+on).then(()=>{
+    if (on) document.getElementById('cam').src = '/stream.mjpg?'+Date.now();
+  });
+}
+function camFlip(){ fetch('/cam?flip=' + (window._flip ? 0 : 1)); window._flip = !window._flip; }
+function camPreset(w,h,f,q){
+  camTouched = Date.now();
+  document.getElementById('camRes').value = w+'x'+h;
+  document.getElementById('sFps').value = f;  document.getElementById('vFps').textContent = f;
+  document.getElementById('sQual').value = q; document.getElementById('vQual').textContent = q;
+  fetch('/cam?width='+w+'&height='+h+'&fps='+f+'&quality='+q);
+}
+
+var cfgTouched = 0;
+function setCfg(k, v){
+  cfgTouched = Date.now();
+  document.getElementById({max_lin:'vMax', turn_gain:'vTurn', pivot:'vPiv', normal:'vNorm'}[k])
+          .textContent = Number(v).toFixed(2);
+  fetch('/set?'+k+'='+v);
+}
+function preset(a,b,c){
+  document.getElementById('sMax').value=a; setCfg('max_lin',a);
+  document.getElementById('sTurn').value=b; setCfg('turn_gain',b);
+  document.getElementById('sPiv').value=c; setCfg('pivot',c);
+}
+function setMode(m){ fetch('/mode?v='+m); }
+
+function showCfg(cfg, mode){
+  if (Date.now() - cfgTouched < 2000) return;      // don't fight the user
+  var map = {max_lin:['sMax','vMax'], turn_gain:['sTurn','vTurn'],
+             pivot:['sPiv','vPiv'], normal:['sNorm','vNorm']};
+  for (var k in map){
+    if (cfg[k] == null) continue;
+    document.getElementById(map[k][0]).value = cfg[k];
+    document.getElementById(map[k][1]).textContent = Number(cfg[k]).toFixed(2);
+  }
+  document.getElementById('mOpen').className   = 'pill ' + (mode==1 ? 'on':'off');
+  document.getElementById('mClosed').className = 'pill ' + (mode==3 ? 'on':'off');
+  document.getElementById('modeHint').textContent = mode==1
+    ? 'open loop: values are throttle, 0.50 \u2248 full power'
+    : (mode==3 ? 'closed loop: values are m/s targets' : 'mode unknown');
+}
+
+function poll(){
+  fetch('/data').then(r=>r.json()).then(d=>{
+    var t = d.telem || {}, dr = d.drive || {};
+
+    document.getElementById('pv').textContent   = (t.pv!=null? t.pv.toFixed(2):'--');
+    document.getElementById('pct').textContent  = (t.pct!=null? t.pct+'%':'--');
+    document.getElementById('amp').textContent  = (t.pa!=null? (Math.abs(t.pa)/1000).toFixed(2):'--');
+    document.getElementById('rail').textContent = (t.v!=null? t.v.toFixed(1):'--');
+    document.getElementById('yaw').textContent  = (t.y!=null? t.y.toFixed(0)+'\\u00b0':'--');
+    document.getElementById('temp').textContent = (t.espTemp!=null? t.espTemp.toFixed(0):'--');
+    if (t.pct!=null) document.getElementById('batbar').style.width = t.pct+'%';
+
+    var arm = document.getElementById('arm');
+    arm.textContent = dr.armed ? 'ARMED' : 'DISARMED';
+    arm.className = 'pill ' + (dr.armed ? 'on' : 'off');
+    if (t.lowBat){ arm.className='pill warn'; arm.textContent='LOW BATTERY'; }
+
+    var dir = document.getElementById('dir');
+    var th = dr.throttle || 0;
+    dir.textContent = th > 0.05 ? 'FORWARD' : (th < -0.05 ? 'REVERSE' : 'IDLE');
+    dir.className = 'pill ' + (Math.abs(th) > 0.05 ? 'on' : 'off');
+
+    var l = dr.l||0, r = dr.r||0;
+    document.getElementById('wl').textContent = l.toFixed(2);
+    document.getElementById('wr').textContent = r.toFixed(2);
+    document.getElementById('spd').textContent = ((l+r)/2).toFixed(2);
+    document.getElementById('steer').textContent = Math.round((dr.steer||0)*45) + '\\u00b0';
+    document.getElementById('pad').textContent = d.pad;
+    drawWheels(l, r, 0.6);
+
+    showCfg(d.cfg||{}, d.mode);
+
+    var cs = d.cam_stat || {}, cm = d.cam || {};
+    document.getElementById('camStat').textContent =
+      (cs.size||'-') + '  ' + (cs.fps||0).toFixed(1) + ' fps  ' +
+      (cs.kbps||0).toFixed(0) + ' kB/s  (' + ((cs.kbps||0)*8/1000).toFixed(1) + ' Mbit/s)';
+    document.getElementById('camErr').textContent = cs.err ? '  ' + cs.err : '';
+    var cb = document.getElementById('camOn');
+    cb.textContent = cm.on ? 'ON' : 'OFF';
+    cb.className = 'pill ' + (cm.on ? 'on' : 'off');
+    if (Date.now() - camTouched > 2000 && cm.fps != null){
+      document.getElementById('sFps').value = cm.fps;
+      document.getElementById('vFps').textContent = cm.fps;
+      document.getElementById('sQual').value = cm.quality;
+      document.getElementById('vQual').textContent = cm.quality;
+    }
+
+    document.getElementById('lrpm').textContent = (d.lidar_rpm||0).toFixed(0);
+    document.getElementById('lpts').textContent = (d.scan||[]).length;
+    drawLidar(d.scan||[]);
+  }).catch(()=>{}).finally(()=> setTimeout(poll, 120));
+}
+document.getElementById('lrange').textContent = (RANGE/1000).toFixed(0);
+poll();
+</script></body></html>"""
+
+
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, *a):
+        pass
+
+    def _json(self, obj):
+        body = json.dumps(obj).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        if self.path.startswith("/stream.mjpg"):
+            self.send_response(200)
+            self.send_header("Age", "0")
+            self.send_header("Cache-Control", "no-cache, private")
+            self.send_header("Pragma", "no-cache")
+            self.send_header("Content-Type",
+                             "multipart/x-mixed-replace; boundary=FRAME")
+            self.end_headers()
+            try:
+                last = None
+                while True:
+                    f = cam_state["frame"]
+                    if f is None or f is last:
+                        time.sleep(0.02)
+                        continue
+                    last = f
+                    self.wfile.write(b"--FRAME\r\n")
+                    self.send_header("Content-Type", "image/jpeg")
+                    self.send_header("Content-Length", str(len(f)))
+                    self.end_headers()
+                    self.wfile.write(f)
+                    self.wfile.write(b"\r\n")
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            return
+
+        if self.path.startswith("/cam"):
+            from urllib.parse import urlparse, parse_qs
+            q = parse_qs(urlparse(self.path).query)
+            for k, v in q.items():
+                if k in CAM:
+                    try:
+                        CAM[k] = (v[0] == "1") if k in ("on", "flip") else int(float(v[0]))
+                    except ValueError:
+                        pass
+            self._json({"ok": True, "cam": CAM})
+            return
+
+        if self.path.startswith("/set"):
+            from urllib.parse import urlparse, parse_qs
+            q = parse_qs(urlparse(self.path).query)
+            for k, v in q.items():
+                if k in CFG:
+                    try:
+                        CFG[k] = float(v[0]) if k != "steer_inv" else (v[0] == "1")
+                    except ValueError:
+                        pass
+            save_cfg()
+            self._json({"ok": True, "cfg": CFG})
+            return
+
+        if self.path.startswith("/mode"):
+            from urllib.parse import urlparse, parse_qs
+            q = parse_qs(urlparse(self.path).query)
+            mt = int(q.get("v", ["1"])[0])
+            ESP.send({"T": 700, "mt": mt, "save": 1})
+            with lock:
+                state["mode"] = mt
+            self._json({"ok": True, "mode": mt})
+            return
+
+        if self.path.startswith("/data"):
+            with lock:
+                body = json.dumps(state).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        else:
+            body = PAGE.encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+
+def main():
+    lport = None
+    if "--lidar" in sys.argv:
+        lport = sys.argv[sys.argv.index("--lidar") + 1]
+    else:
+        found = sorted(glob.glob("/dev/ttyUSB*"))
+        lport = found[0] if found else None
+
+    global ESP
+    ESP = Esp()
+    esp = ESP
+    print(f"ESP32 on {ESP_PORT}")
+
+    if lport:
+        threading.Thread(target=lidar_thread, args=(lport,), daemon=True).start()
+        print(f"LiDAR on {lport}")
+    else:
+        print("No /dev/ttyUSB* found - lidar view will be empty")
+
+    threading.Thread(target=camera_thread, daemon=True).start()
+
+    if "--no-pad" not in sys.argv:
+        threading.Thread(target=pad_thread, args=(esp,), daemon=True).start()
+
+    # keep telemetry fresh even when the board's stream is quiet
+    def poke():
+        while True:
+            esp.send({"T": 710})
+            time.sleep(1.0)
+    threading.Thread(target=poke, daemon=True).start()
+
+    print(f"\nDashboard: http://<pi-ip>:{HTTP_PORT}\n")
+    ThreadingHTTPServer(("0.0.0.0", HTTP_PORT), Handler).serve_forever()
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\nbye")

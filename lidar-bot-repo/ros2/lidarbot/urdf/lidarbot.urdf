@@ -1,0 +1,72 @@
+<?xml version="1.0"?>
+<!-- lidar-bot.
+
+     What SLAM actually cares about is the height of base_laser above the
+     ground, i.e. base_joint z + laser_joint z. That was MEASURED at 133 mm,
+     floor to the middle of the lidar's window, after the caster conversion.
+
+         base_joint  0.040  (wheel radius - where the axle sits)
+       + laser_joint 0.093
+       = 0.133 m to the lidar plane
+
+     If the wheels are not 80 mm, change base_joint to the real radius and take
+     the same amount off laser_joint so the SUM stays at 0.133. Get the total
+     wrong and every wall lands at the wrong distance, which smears the map.
+
+     The chassis is nose-up ~6 mm from the caster, but the lidar was shimmed
+     level against the ground, so rpy stays zero. -->
+<robot name="lidarbot">
+
+  <link name="base_footprint"/>
+
+  <link name="base_link">
+    <visual>
+      <origin xyz="0 0 0.05"/>
+      <geometry><box size="0.30 0.22 0.10"/></geometry>
+      <material name="body"><color rgba="0.25 0.28 0.35 1"/></material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0.05"/>
+      <geometry><box size="0.30 0.22 0.10"/></geometry>
+    </collision>
+  </link>
+
+  <joint name="base_joint" type="fixed">
+    <parent link="base_footprint"/>
+    <child link="base_link"/>
+    <origin xyz="0 0 0.040"/>   <!-- wheel radius: 80 mm wheel = 0.040 -->
+  </joint>
+
+  <link name="imu_link"/>
+  <joint name="imu_joint" type="fixed">
+    <parent link="base_link"/>
+    <child link="imu_link"/>
+    <origin xyz="0 0 0.06"/>
+  </joint>
+
+  <!-- LIDAR: set xyz to the sensor's optical centre relative to base_link,
+       and rpy yaw to however it is rotated on the mast. -->
+  <link name="base_laser">
+    <visual>
+      <geometry><cylinder radius="0.019" length="0.035"/></geometry>
+      <material name="lidar"><color rgba="0.1 0.6 0.9 1"/></material>
+    </visual>
+  </link>
+  <!-- Camera. Only the topic matters for the Image panel; these numbers
+       matter if you ever want the view placed in the 3D scene, so measure
+       them then. Placeholder: on the mast, just below the lidar. -->
+  <link name="camera_link"/>
+  <joint name="camera_joint" type="fixed">
+    <parent link="base_link"/>
+    <child link="camera_link"/>
+    <origin xyz="0.10 0.0 0.070" rpy="0 0 0"/>
+  </joint>
+
+  <joint name="laser_joint" type="fixed">
+    <parent link="base_link"/>
+    <child link="base_laser"/>
+    <!-- 0.133 m measured from the floor, minus the 0.040 m base_joint -->
+    <origin xyz="0.0 0.0 0.093" rpy="0 0 0"/>
+  </joint>
+
+</robot>

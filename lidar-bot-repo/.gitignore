@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+install/
+log/
+.venv/
+venv/
+robot-venv/
+*.bak
+.DS_Store
+maps/
+*.pgm
+*.posegraph
+*.data
+.vscode/
+.idea/

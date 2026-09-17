@@ -74,3 +74,5 @@ Also CAD modelling for enclosure, can be offshored to ipad (shapr3d)
 Parts ordered, raspberry pi flashed with ubuntu and loading most prerequisites for ROS2. Issues with wifi connection through walls but stable signal so far while out of a case. 
 ### 4/9/26
 Draft modelling progressed, aux parts and material arrived. Development on ROS2 > Foxglove made, simulation mapping with SLAM completed.
+### 17/9/26
+Build complete! basic navigation software built through python and ROS2. Calibration suite through esp32 firmware for motor calib and network config
