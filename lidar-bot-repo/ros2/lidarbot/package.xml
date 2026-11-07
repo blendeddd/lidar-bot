@@ -3,7 +3,7 @@
   <name>lidarbot</name>
   <version>0.1.0</version>
   <description>lidar-bot base bridge, description and bringup</description>
-  <maintainer email="harpreets8996@gmail.com">jaz</maintainer>
+  <maintainer email="blendeddd@users.noreply.github.com">jaz</maintainer>
   <license>MIT</license>
 
   <exec_depend>rclpy</exec_depend>
